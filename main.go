@@ -30,15 +30,20 @@ const (
 )
 
 var pubDateLayouts = []string{
-	time.RFC1123Z,                     // "Mon, 02 Jan 2006 15:04:05 -0700"
-	time.RFC1123,                      // "Mon, 02 Jan 2006 15:04:05 MST"
-	time.RFC822Z,                      // "02 Jan 06 15:04 -0700"
-	time.RFC822,                       // "02 Jan 06 15:04 MST"
-	time.RFC3339,                      // "2006-01-02T15:04:05Z07:00"
-	"Mon, 02 Jan 2006 15:04:05 -0700", // 明示的なパターン
+	time.RFC1123Z,
+	time.RFC1123,
+	time.RFC822Z,
+	time.RFC822,
+	time.RFC3339,
+	"Mon, 02 Jan 2006 15:04:05 -0700",
 	"Mon, 02 Jan 2006 15:04:05 MST",
 	"2006-01-02 15:04:05",
 	"02 Jan 2006 15:04:05",
+}
+
+type Config struct {
+	GlobalExcludeWords []string           `json:"global_exclude_keywords"`
+	Configs            []FeedFilterConfig `json:"configs"`
 }
 
 type FeedFilterConfig struct {
@@ -96,8 +101,8 @@ func lambdaHandler(ctx context.Context, req events.APIGatewayProxyRequest) (even
 	if err != nil {
 		return events.APIGatewayProxyResponse{
 			StatusCode: http.StatusBadRequest,
-			Body:       "カテゴリの指定が不正です: " + err.Error(),
-		}, nil
+			Body:       "configの取得に失敗しました: " + err.Error(),
+		}, err
 	}
 
 	rssXML, err := generateRSS(*config)
@@ -105,7 +110,7 @@ func lambdaHandler(ctx context.Context, req events.APIGatewayProxyRequest) (even
 		return events.APIGatewayProxyResponse{
 			StatusCode: http.StatusInternalServerError,
 			Body:       "RSS生成エラー: " + err.Error(),
-		}, nil
+		}, err
 	}
 
 	return events.APIGatewayProxyResponse{
@@ -135,20 +140,6 @@ func runLocal() error {
 }
 
 func fetchFeedFilterConfig(ctx context.Context, categoryName string) (*FeedFilterConfig, error) {
-	filterConfigs, err := loadFilterConfigs(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("設定の読み込み失敗: %w", err)
-	}
-
-	for _, cfg := range filterConfigs {
-		if cfg.Category == categoryName {
-			return &cfg, nil
-		}
-	}
-	return nil, fmt.Errorf("カテゴリ '%s' が見つかりません", categoryName)
-}
-
-func loadFilterConfigs(ctx context.Context) ([]FeedFilterConfig, error) {
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -164,11 +155,18 @@ func loadFilterConfigs(ctx context.Context) ([]FeedFilterConfig, error) {
 	}
 	defer output.Body.Close()
 
-	var configs []FeedFilterConfig
-	if err := json.NewDecoder(output.Body).Decode(&configs); err != nil {
+	var conf Config
+	if err := json.NewDecoder(output.Body).Decode(&conf); err != nil {
 		return nil, err
 	}
-	return configs, nil
+
+	for _, c := range conf.Configs {
+		if c.Category == categoryName {
+			c.ExcludeKeywords = append(c.ExcludeKeywords, conf.GlobalExcludeWords...)
+			return &c, nil
+		}
+	}
+	return nil, fmt.Errorf("カテゴリ '%s' が見つかりません", categoryName)
 }
 
 func generateRSS(cfg FeedFilterConfig) (string, error) {
@@ -254,7 +252,6 @@ func parsePubDate(s string) time.Time {
 			return t
 		}
 	}
-	// 失敗したら最も古い日付を返す（= 一番後ろにされる）
 	log.Printf("日付パース失敗: %s", s)
 	return time.Time{}
 }
