@@ -43,6 +43,8 @@ var pubDateLayouts = []string{
 
 type Config struct {
 	GlobalExcludeWords []string           `json:"global_exclude_keywords"`
+	DelayedDomains     []string           `json:"delayed_domains"`
+	DelayDays          int                `json:"delay_days"`
 	Configs            []FeedFilterConfig `json:"configs"`
 }
 
@@ -97,7 +99,7 @@ func lambdaHandler(ctx context.Context, req events.APIGatewayProxyRequest) (even
 		}, nil
 	}
 
-	config, err := fetchFeedFilterConfig(ctx, req.QueryStringParameters["category"])
+	feedConfig, globalConfig, err := fetchFeedFilterConfig(ctx, req.QueryStringParameters["category"])
 	if err != nil {
 		return events.APIGatewayProxyResponse{
 			StatusCode: http.StatusBadRequest,
@@ -105,7 +107,7 @@ func lambdaHandler(ctx context.Context, req events.APIGatewayProxyRequest) (even
 		}, err
 	}
 
-	rssXML, err := generateRSS(*config)
+	rssXML, err := generateRSS(*feedConfig, *globalConfig)
 	if err != nil {
 		return events.APIGatewayProxyResponse{
 			StatusCode: http.StatusInternalServerError,
@@ -125,12 +127,12 @@ func runLocal() error {
 		return fmt.Errorf("カテゴリを指定してください（例: go run main.go games）")
 	}
 
-	config, err := fetchFeedFilterConfig(context.Background(), os.Args[1])
+	feedConfig, globalConfig, err := fetchFeedFilterConfig(context.Background(), os.Args[1])
 	if err != nil {
 		return err
 	}
 
-	rssXML, err := generateRSS(*config)
+	rssXML, err := generateRSS(*feedConfig, *globalConfig)
 	if err != nil {
 		return err
 	}
@@ -139,10 +141,10 @@ func runLocal() error {
 	return nil
 }
 
-func fetchFeedFilterConfig(ctx context.Context, categoryName string) (*FeedFilterConfig, error) {
+func fetchFeedFilterConfig(ctx context.Context, categoryName string) (*FeedFilterConfig, *Config, error) {
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	client := s3.NewFromConfig(cfg)
@@ -151,25 +153,25 @@ func fetchFeedFilterConfig(ctx context.Context, categoryName string) (*FeedFilte
 		Key:    aws.String(s3Key),
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer output.Body.Close()
 
 	var conf Config
 	if err := json.NewDecoder(output.Body).Decode(&conf); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for _, c := range conf.Configs {
 		if c.Category == categoryName {
 			c.ExcludeKeywords = append(c.ExcludeKeywords, conf.GlobalExcludeWords...)
-			return &c, nil
+			return &c, &conf, nil
 		}
 	}
-	return nil, fmt.Errorf("カテゴリ '%s' が見つかりません", categoryName)
+	return nil, nil, fmt.Errorf("カテゴリ '%s' が見つかりません", categoryName)
 }
 
-func generateRSS(cfg FeedFilterConfig) (string, error) {
+func generateRSS(cfg FeedFilterConfig, globalConfig Config) (string, error) {
 	fp := gofeed.NewParser()
 	var items []RSSFeedItem
 
@@ -183,6 +185,10 @@ func generateRSS(cfg FeedFilterConfig) (string, error) {
 
 		for _, entry := range feed.Items {
 			if !passesFilters(entry, cfg) {
+				continue
+			}
+
+			if !isOldEnough(entry, url, globalConfig) {
 				continue
 			}
 
@@ -244,6 +250,29 @@ func passesFilters(entry *gofeed.Item, cfg FeedFilterConfig) bool {
 	}
 
 	return true
+}
+
+func isOldEnough(entry *gofeed.Item, feedURL string, globalConfig Config) bool {
+	if !domainRequiresDelay(feedURL, globalConfig) {
+		return true
+	}
+
+	pubDate := parsePubDate(entry.Published)
+	if pubDate.IsZero() {
+		return false
+	}
+
+	delayThreshold := time.Now().AddDate(0, 0, -globalConfig.DelayDays)
+	return pubDate.Before(delayThreshold)
+}
+
+func domainRequiresDelay(feedURL string, globalConfig Config) bool {
+	for _, domain := range globalConfig.DelayedDomains {
+		if strings.Contains(feedURL, domain) {
+			return true
+		}
+	}
+	return false
 }
 
 func parsePubDate(s string) time.Time {

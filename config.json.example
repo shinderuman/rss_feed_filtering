@@ -1,0 +1,36 @@
+{
+    "global_exclude_keywords": [
+        "keyword1",
+        "keyword2"
+    ],
+    "delayed_domains": [
+        "example.invalid",
+        "sample-site.invalid"
+    ],
+    "delay_days": 8,
+    "configs": [
+        {
+            "category": "category1",
+            "description": "Category 1 RSS Feed",
+            "include_keywords": [
+                "include_word"
+            ],
+            "exclude_keywords": [
+                "exclude_word"
+            ],
+            "urls": [
+                "https://example.invalid/feed.xml",
+                "https://example.invalid/rss"
+            ]
+        },
+        {
+            "category": "category2",
+            "description": "Category 2 RSS Feed",
+            "include_keywords": [],
+            "exclude_keywords": [],
+            "urls": [
+                "https://sample-site.invalid/feed"
+            ]
+        }
+    ]
+}
