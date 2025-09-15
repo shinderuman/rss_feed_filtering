@@ -188,13 +188,13 @@ func generateRSS(cfg FeedFilterConfig, globalConfig Config) (string, error) {
 				continue
 			}
 
-			pubDate := entry.Published
 			if !isOldEnough(entry, url, globalConfig) {
 				continue
-			} else {
-				if domainRequiresDelay(url, globalConfig) {
-					pubDate = adjustPubDateForDelay(entry.Published, globalConfig)
-				}
+			}
+
+			pubDate := entry.Published
+			if domainRequiresDelay(url, globalConfig) {
+				pubDate = adjustPubDateForDelay(entry.Published, globalConfig)
 			}
 
 			items = append(items, RSSFeedItem{
@@ -263,10 +263,6 @@ func isOldEnough(entry *gofeed.Item, feedURL string, globalConfig Config) bool {
 	}
 
 	pubDate := parsePubDate(entry.Published)
-	if pubDate.IsZero() {
-		return false
-	}
-
 	delayThreshold := time.Now().AddDate(0, 0, -globalConfig.DelayDays)
 	return pubDate.Before(delayThreshold)
 }
