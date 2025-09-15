@@ -188,15 +188,20 @@ func generateRSS(cfg FeedFilterConfig, globalConfig Config) (string, error) {
 				continue
 			}
 
+			pubDate := entry.Published
 			if !isOldEnough(entry, url, globalConfig) {
 				continue
+			} else {
+				if domainRequiresDelay(url, globalConfig) {
+					pubDate = adjustPubDateForDelay(entry.Published, globalConfig)
+				}
 			}
 
 			items = append(items, RSSFeedItem{
 				Title:       fmt.Sprintf("[%s] %s", feed.Title, entry.Title),
 				Link:        entry.Link,
 				Description: entry.Description,
-				PubDate:     entry.Published,
+				PubDate:     pubDate,
 			})
 		}
 	}
@@ -273,6 +278,12 @@ func domainRequiresDelay(feedURL string, globalConfig Config) bool {
 		}
 	}
 	return false
+}
+
+func adjustPubDateForDelay(originalPubDate string, globalConfig Config) string {
+	pubDate := parsePubDate(originalPubDate)
+	adjustedDate := pubDate.AddDate(0, 0, globalConfig.DelayDays)
+	return adjustedDate.Format(time.RFC1123Z)
 }
 
 func parsePubDate(s string) time.Time {
