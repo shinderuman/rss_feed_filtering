@@ -183,18 +183,22 @@ func generateRSS(cfg FeedFilterConfig, globalConfig Config) (string, error) {
 			// return "", err
 		}
 
+		var filteredEntries []*gofeed.Item
 		for _, entry := range feed.Items {
-			if !passesFilters(entry, cfg) {
-				continue
+			if passesFilters(entry, cfg) {
+				filteredEntries = append(filteredEntries, entry)
 			}
+		}
 
-			if !isOldEnough(entry, url, globalConfig) {
+		skipFirst := domainRequiresDelay(url, globalConfig)
+		for i, entry := range filteredEntries {
+			if i == 0 && skipFirst {
 				continue
 			}
 
 			pubDate := entry.Published
-			if domainRequiresDelay(url, globalConfig) {
-				pubDate = adjustPubDateForDelay(entry.Published, globalConfig)
+			if skipFirst && i > 0 {
+				pubDate = filteredEntries[i-1].Published
 			}
 
 			items = append(items, RSSFeedItem{
@@ -257,16 +261,6 @@ func passesFilters(entry *gofeed.Item, cfg FeedFilterConfig) bool {
 	return true
 }
 
-func isOldEnough(entry *gofeed.Item, feedURL string, globalConfig Config) bool {
-	if !domainRequiresDelay(feedURL, globalConfig) {
-		return true
-	}
-
-	pubDate := parsePubDate(entry.Published)
-	delayThreshold := time.Now().AddDate(0, 0, -globalConfig.DelayDays)
-	return pubDate.Before(delayThreshold)
-}
-
 func domainRequiresDelay(feedURL string, globalConfig Config) bool {
 	for _, domain := range globalConfig.DelayedDomains {
 		if strings.Contains(feedURL, domain) {
@@ -274,12 +268,6 @@ func domainRequiresDelay(feedURL string, globalConfig Config) bool {
 		}
 	}
 	return false
-}
-
-func adjustPubDateForDelay(originalPubDate string, globalConfig Config) string {
-	pubDate := parsePubDate(originalPubDate)
-	adjustedDate := pubDate.AddDate(0, 0, globalConfig.DelayDays)
-	return adjustedDate.Format(time.RFC1123Z)
 }
 
 func parsePubDate(s string) time.Time {
