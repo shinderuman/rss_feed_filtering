@@ -44,7 +44,6 @@ var pubDateLayouts = []string{
 type Config struct {
 	GlobalExcludeWords []string           `json:"global_exclude_keywords"`
 	DelayedDomains     []string           `json:"delayed_domains"`
-	DelayDays          int                `json:"delay_days"`
 	Configs            []FeedFilterConfig `json:"configs"`
 }
 

@@ -7,7 +7,7 @@ A serverless RSS feed aggregation and filtering service built with Go and AWS La
 - **Multi-source RSS aggregation**: Combine multiple RSS feeds into a single filtered feed
 - **Keyword filtering**: Include/exclude articles based on configurable keywords
 - **Category-based configuration**: Organize feeds by categories with different filtering rules
-- **Delayed publishing**: Configure delays for specific domains to control content timing
+- **Paywall article handling**: Skip the latest article from specific domains (typically paywalled) and wait for it to become free
 - **AWS Lambda deployment**: Serverless architecture with automatic scaling
 - **Local development support**: Run and test locally before deployment
 
@@ -61,7 +61,6 @@ Create a `config.json` file in your S3 bucket with the following structure:
 {
     "global_exclude_keywords": ["spam", "ads"],
     "delayed_domains": ["news-site.invalid"],
-    "delay_days": 7,
     "configs": [
         {
             "category": "tech",
@@ -80,8 +79,7 @@ Create a `config.json` file in your S3 bucket with the following structure:
 ### Configuration Options
 
 - `global_exclude_keywords`: Keywords to exclude across all categories
-- `delayed_domains`: Domains that require publication delay
-- `delay_days`: Number of days to delay publication for delayed domains
+- `delayed_domains`: Domains where the latest article is skipped (useful for paywalled content that becomes free over time)
 - `configs`: Array of category configurations
 
 ## API Usage
@@ -109,7 +107,7 @@ Go と AWS Lambda で構築されたサーバーレス RSS フィード集約・
 - **マルチソース RSS 集約**: 複数の RSS フィードを単一のフィルタリングされたフィードに統合
 - **キーワードフィルタリング**: 設定可能なキーワードに基づいて記事を含める/除外する
 - **カテゴリベース設定**: 異なるフィルタリングルールでフィードをカテゴリ別に整理
-- **遅延公開**: 特定のドメインに対して遅延を設定してコンテンツのタイミングを制御
+- **有料記事対応**: 特定のドメインの最新記事をスキップ（有料記事が時間経過で無料になるのを待つ）
 - **AWS Lambda デプロイメント**: 自動スケーリング機能付きサーバーレスアーキテクチャ
 - **ローカル開発サポート**: デプロイ前にローカルで実行・テスト可能
 
@@ -163,7 +161,6 @@ S3 バケットに以下の構造で `config.json` ファイルを作成:
 {
     "global_exclude_keywords": ["スパム", "広告"],
     "delayed_domains": ["news-site.invalid"],
-    "delay_days": 7,
     "configs": [
         {
             "category": "tech",
@@ -182,8 +179,7 @@ S3 バケットに以下の構造で `config.json` ファイルを作成:
 ### 設定オプション
 
 - `global_exclude_keywords`: すべてのカテゴリで除外するキーワード
-- `delayed_domains`: 公開遅延が必要なドメイン
-- `delay_days`: 遅延ドメインの公開を遅らせる日数
+- `delayed_domains`: 最新記事をスキップするドメイン（時間経過で有料記事が無料になるサイトに有効）
 - `configs`: カテゴリ設定の配列
 
 ## API 使用方法

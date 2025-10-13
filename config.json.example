@@ -7,7 +7,6 @@
         "example.invalid",
         "sample-site.invalid"
     ],
-    "delay_days": 8,
     "configs": [
         {
             "category": "category1",
