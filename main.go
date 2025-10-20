@@ -196,14 +196,21 @@ func generateRSS(cfg FeedFilterConfig, globalConfig Config) (string, error) {
 			}
 
 			pubDate := entry.Published
+			description := entry.Description
+
 			if skipFirst && i > 0 {
 				pubDate = filteredEntries[i-1].Published
+
+				if i+1 < len(filteredEntries) {
+					nextEntry := filteredEntries[i+1]
+					description = fmt.Sprintf("%s\n\n前回: <a href=\"%s\">%s</a>", entry.Description, nextEntry.Link, nextEntry.Title)
+				}
 			}
 
 			items = append(items, RSSFeedItem{
 				Title:       fmt.Sprintf("[%s] %s", feed.Title, entry.Title),
 				Link:        entry.Link,
-				Description: entry.Description,
+				Description: description,
 				PubDate:     pubDate,
 			})
 		}
