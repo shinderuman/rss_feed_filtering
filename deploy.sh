@@ -106,7 +106,75 @@ deploy_function() {
             --output json 2>/dev/null | jq -r '.FunctionUrl // empty')
         
         if [ -n "$function_url" ]; then
+            # Get token info from main.go
+            local token_info
+            token_info=$(get_token_info)
+            
             echo "   🌐 Function URL: $function_url"
+            echo "   📡 RSS Feed URL: ${function_url}?category=CATEGORY&${token_info}"
+            echo "      Example: ${function_url}?category=tech&${token_info}"
+        fi
+        
+        # Get API Gateway URL if exists
+        local api_gateway_url
+        local region
+        region=$(aws configure get region --profile "$AWS_PROFILE" 2>/dev/null)
+        
+        # Try to find API Gateway v2 (HTTP API) first, then v1 (REST API)
+        local api_gateway_url=""
+        local api_name=""
+        
+        # Check API Gateway v2 (HTTP API)
+        local v2_apis
+        v2_apis=$(aws apigatewayv2 get-apis \
+            --profile "$AWS_PROFILE" \
+            --region "$region" \
+            --output json 2>/dev/null | jq -r '.Items[]? | select(.Name | contains("'$FUNCTION_NAME'")) | .ApiEndpoint + "|" + .Name' 2>/dev/null)
+        
+        if [ -n "$v2_apis" ]; then
+            echo "$v2_apis" | head -1 | while IFS='|' read -r endpoint name; do
+                if [ -n "$endpoint" ]; then
+                    # Extract API ID from endpoint
+                    local api_id
+                    api_id=$(echo "$endpoint" | sed 's|https://||' | cut -d'.' -f1)
+                    
+                    # Get stage and route information
+                    local stage_name
+                    stage_name=$(aws apigatewayv2 get-stages \
+                        --api-id "$api_id" \
+                        --profile "$AWS_PROFILE" \
+                        --region "$region" \
+                        --output json 2>/dev/null | jq -r '.Items[0].StageName // "default"' 2>/dev/null)
+                    
+                    local route_path
+                    route_path=$(aws apigatewayv2 get-routes \
+                        --api-id "$api_id" \
+                        --profile "$AWS_PROFILE" \
+                        --region "$region" \
+                        --output json 2>/dev/null | jq -r '.Items[0].RouteKey // ""' 2>/dev/null | sed 's/ANY //')
+                    
+                    # Construct full URL
+                    local full_url="${endpoint}/${stage_name}${route_path}"
+                    
+                    echo "   🔗 API Gateway v2: $full_url ($name)"
+                    
+                    # Get token info from main.go
+                    local token_info
+                    token_info=$(get_token_info)
+                    
+                    echo "   📡 RSS Feed URL: ${full_url}?${token_info}&category=CATEGORY"
+                    echo "      Example: ${full_url}?${token_info}&category=comic_series"
+                fi
+            done
+        else
+            # Fallback if no API Gateway v2 found
+            echo "   ⚠️  API Gateway v2: Could not find matching API (check AWS console)"
+            
+            # Get token info from main.go for fallback case
+            local token_info
+            token_info=$(get_token_info)
+            
+            echo "   📡 RSS Feed URL: https://YOUR-API-ID.execute-api.${region}.amazonaws.com/?category=CATEGORY&${token_info}"
         fi
         
     else
@@ -160,6 +228,17 @@ format_timestamp() {
     
     # Simple format conversion: 2025-08-10T16:14:58Z -> 2025-08-10 16:14:58 UTC
     echo "${clean_timestamp}" | sed 's/T/ /' | sed 's/Z/ UTC/'
+}
+
+# Function to extract token information from main.go
+get_token_info() {
+    local token_key
+    local token_value
+    
+    token_key=$(grep -o 'accessTokenKey = "[^"]*"' main.go | sed 's/accessTokenKey = "//;s/"//' 2>/dev/null || echo "token")
+    token_value=$(grep -o 'accessTokenVal = "[^"]*"' main.go | sed 's/accessTokenVal = "//;s/"//' 2>/dev/null || echo "TOKEN")
+    
+    echo "${token_key}=${token_value}"
 }
 
 # Function to format timeout into readable format
@@ -273,8 +352,8 @@ main() {
     if [ "$BUILD_ONLY" != true ]; then
         echo ""
         echo "📊 Deployment Summary:"
-        echo "   🔗 AWS Console: https://console.aws.amazon.com/lambda/home?region=$(aws configure get region --profile "$AWS_PROFILE" 2>/dev/null || echo "us-east-1")#/functions/$FUNCTION_NAME"
-        echo "   📈 CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=$(aws configure get region --profile "$AWS_PROFILE" 2>/dev/null || echo "us-east-1")#logsV2:log-groups/log-group/%252Faws%252Flambda%252F$FUNCTION_NAME"
+        echo "   🔗 AWS Console: https://console.aws.amazon.com/lambda/home?region=$(aws configure get region --profile "$AWS_PROFILE" 2>/dev/null)#/functions/$FUNCTION_NAME"
+        echo "   📈 CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/home?region=$(aws configure get region --profile "$AWS_PROFILE" 2>/dev/null)#logsV2:log-groups/log-group/%252Faws%252Flambda%252F$FUNCTION_NAME"
     fi
 }
 
