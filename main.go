@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	s3Bucket       = "rss-feed-filtering"
-	s3Key          = "config.json"
+	s3Bucket       = "universal-lambda-config"
+	s3Key          = "rss/config.json"
 	accessTokenKey = "token"
 	accessTokenVal = "shoh7Ahghoongiez3PhuYiungie3XaiphooVooquai3daishie"
 )
