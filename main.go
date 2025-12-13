@@ -78,6 +78,21 @@ type NotificationItem struct {
 	EnableMastodon bool
 }
 
+func (n NotificationItem) Format() string {
+	return fmt.Sprintf(`[%s] %s
+%s
+
+%s
+
+#%s`,
+		n.FeedTitle,
+		n.Title,
+		n.Link,
+		n.Description,
+		n.Category,
+	)
+}
+
 func main() {
 	if isLambda() {
 		lambda.Start(run)
@@ -441,11 +456,9 @@ func sendNotifications(ctx context.Context, item NotificationItem) error {
 func postToSlack(item NotificationItem) error {
 	api := slack.New(slackBotToken)
 
-	msgText := fmt.Sprintf("*[%s] %s*\n%s\nCategory: %s", item.FeedTitle, item.Title, item.Link, item.Category)
-
 	_, _, err := api.PostMessage(
 		item.SlackChannelID,
-		slack.MsgOptionText(msgText, false),
+		slack.MsgOptionText(item.Format(), false),
 	)
 	return err
 }
@@ -456,7 +469,7 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 		AccessToken: mastodonAccessToken,
 	})
 
-	status := fmt.Sprintf("[%s] %s\n%s #%s", item.FeedTitle, item.Title, item.Link, item.Category)
+	status := item.Format()
 	runes := []rune(status)
 	if len(runes) > mastodonMaxStatusLength {
 		status = string(runes[:mastodonMaxStatusLength-3]) + "..."
