@@ -5,9 +5,10 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"maps"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/slack-go/slack"
 
 	"github.com/joho/godotenv"
@@ -89,11 +91,15 @@ func (n NotificationItem) Format() string {
 }
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
 	if isLambda() {
 		lambda.Start(run)
 	} else {
 		if err := run(context.Background()); err != nil {
-			log.Fatalf("Execution failed: %v", err)
+			slog.Error("Execution failed", "error", err)
+			os.Exit(1)
 		}
 	}
 }
@@ -122,13 +128,12 @@ func run(ctx context.Context) error {
 
 	state, err := loadState(ctx, s3Client)
 	if err != nil {
-		log.Printf("State load warn (starting fresh): %v", err)
-		state = &State{Feeds: make(map[string]FeedState)}
+		return fmt.Errorf("State load error: %w", err)
 	}
 
 	updatedState, processErr := processFeeds(ctx, appConfig, state)
 	if processErr != nil {
-		log.Printf("Some feeds failed: %v", processErr)
+		slog.Error("Some feeds failed", "error", processErr)
 	}
 
 	if err := saveState(ctx, s3Client, updatedState); err != nil {
@@ -170,6 +175,11 @@ func loadState(ctx context.Context, client *s3.Client) (*State, error) {
 		Key:    aws.String(s3StateKey),
 	})
 	if err != nil {
+		var noKey *types.NoSuchKey
+		if errors.As(err, &noKey) {
+			slog.Info("State file not found, starting fresh")
+			return &State{Feeds: make(map[string]FeedState)}, nil
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -196,9 +206,12 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 
 			updatedFeedState, err := processSingleFeed(ctx, url, feedCfg, excludeWords, appConfig.DelayedDomains, currentState)
 			if err != nil {
-				msg := fmt.Sprintf("Failed to process %s: %v", url, err)
-				log.Println(msg)
-				errorList = append(errorList, msg)
+				slog.Error("Failed to process feed",
+					"error_type", "fetch_error",
+					"url", url,
+					"error", err,
+				)
+				errorList = append(errorList, fmt.Sprintf("Failed to process %s: %v", url, err))
 				continue
 			}
 
@@ -243,7 +256,9 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 
 	notifyItems := getNewItemsWithEnrichment(feed.Items, currentState.LastLink, feedCfg.IncludeKeywords, excludeWords, delayedDomains, url)
 
-	processNotifications(ctx, notifyItems, feed, feedCfg)
+	if err := processNotifications(ctx, notifyItems, feed, feedCfg); err != nil {
+		return &nextState, err
+	}
 	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, delayedDomains)
 
 	return &nextState, nil
@@ -343,7 +358,8 @@ func getNewItemsWithEnrichment(items []*gofeed.Item, lastLink string, include, e
 	return notifyItems
 }
 
-func processNotifications(ctx context.Context, items []*gofeed.Item, feed *gofeed.Feed, feedCfg FeedFilterConfig) {
+func processNotifications(ctx context.Context, items []*gofeed.Item, feed *gofeed.Feed, feedCfg FeedFilterConfig) error {
+	var errs []string
 	for _, item := range items {
 		nItem := NotificationItem{
 			Title:          item.Title,
@@ -355,10 +371,15 @@ func processNotifications(ctx context.Context, items []*gofeed.Item, feed *gofee
 		}
 
 		if err := sendNotifications(ctx, nItem); err != nil {
-			log.Printf("Notification failed for %s: %v", item.Title, err)
+			errs = append(errs, fmt.Sprintf("Notification failed for %s: %v", item.Title, err))
 		}
 		time.Sleep(1 * time.Second)
 	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, ", "))
+	}
+	return nil
 }
 
 func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, notifyItems []*gofeed.Item, feed *gofeed.Feed, url string, delayedDomains []string) {
@@ -421,15 +442,27 @@ func cleanHTML(htmlContent string) string {
 func sendNotifications(ctx context.Context, item NotificationItem) error {
 	var errs []string
 
+	logError := func(platform string, err error) {
+		slog.Error("Notification failed",
+			"error_type", "notification_error",
+			"platform", platform,
+			"item_title", item.Title,
+			"url", item.Link,
+			"error", err,
+		)
+	}
+
 	if item.SlackChannelID != "" {
 		if err := postToSlack(item); err != nil {
-			errs = append(errs, fmt.Sprintf("Slack error: %v", err))
+			logError("slack", err)
+			errs = append(errs, fmt.Sprintf("Slack: %v", err))
 		}
 	}
 
 	if item.EnableMastodon {
 		if err := postToMastodon(ctx, item); err != nil {
-			errs = append(errs, fmt.Sprintf("Mastodon error: %v", err))
+			logError("mastodon", err)
+			errs = append(errs, fmt.Sprintf("Mastodon: %v", err))
 		}
 	}
 
