@@ -441,7 +441,7 @@ func sendNotifications(ctx context.Context, item NotificationItem) error {
 func postToSlack(item NotificationItem) error {
 	api := slack.New(slackBotToken)
 
-	msgText := fmt.Sprintf("*%s*\n%s\nCategory: %s", item.Title, item.Link, item.Category)
+	msgText := fmt.Sprintf("*[%s] %s*\n%s\nCategory: %s", item.FeedTitle, item.Title, item.Link, item.Category)
 
 	_, _, err := api.PostMessage(
 		item.SlackChannelID,
@@ -456,7 +456,7 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 		AccessToken: mastodonAccessToken,
 	})
 
-	status := fmt.Sprintf("%s\n%s #%s", item.Title, item.Link, item.Category)
+	status := fmt.Sprintf("[%s] %s\n%s #%s", item.FeedTitle, item.Title, item.Link, item.Category)
 	runes := []rune(status)
 	if len(runes) > mastodonMaxStatusLength {
 		status = string(runes[:mastodonMaxStatusLength-3]) + "..."
