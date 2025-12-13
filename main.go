@@ -22,6 +22,8 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/mattn/go-mastodon"
 	"github.com/mmcdole/gofeed"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
 const (
@@ -250,7 +252,7 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 		nItem := NotificationItem{
 			Title:          item.Title,
 			Link:           item.Link,
-			Description:    item.Description,
+			Description:    cleanHTML(item.Description),
 			PubDate:        safeParseDate(item.Published),
 			FeedTitle:      feed.Title,
 			SlackChannelID: feedCfg.SlackChannelID,
@@ -424,6 +426,14 @@ func safeParseDate(d string) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+func cleanHTML(htmlContent string) string {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
+	if err != nil {
+		return htmlContent
+	}
+	return strings.TrimSpace(doc.Text())
 }
 
 func sendNotifications(ctx context.Context, item NotificationItem) error {
