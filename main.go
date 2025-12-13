@@ -48,7 +48,6 @@ type Config struct {
 
 type FeedFilterConfig struct {
 	Category        string   `json:"category"`
-	Description     string   `json:"description"`
 	IncludeKeywords []string `json:"include_keywords"`
 	ExcludeKeywords []string `json:"exclude_keywords"`
 	URLs            []string `json:"urls"`
@@ -73,7 +72,6 @@ type NotificationItem struct {
 	Description    string
 	PubDate        time.Time
 	FeedTitle      string
-	Category       string
 	SlackChannelID string
 	EnableMastodon bool
 }
@@ -82,14 +80,11 @@ func (n NotificationItem) Format() string {
 	return fmt.Sprintf(`[%s] %s
 %s
 
-%s
-
-#%s`,
+%s`,
 		n.FeedTitle,
 		n.Title,
 		n.Link,
 		n.Description,
-		n.Category,
 	)
 }
 
@@ -258,7 +253,6 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 			Description:    item.Description,
 			PubDate:        safeParseDate(item.Published),
 			FeedTitle:      feed.Title,
-			Category:       feedCfg.Category,
 			SlackChannelID: feedCfg.SlackChannelID,
 			EnableMastodon: feedCfg.EnableMastodon,
 		}
