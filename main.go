@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"strings"
@@ -49,7 +50,6 @@ type Config struct {
 }
 
 type FeedFilterConfig struct {
-	Category        string   `json:"category"`
 	IncludeKeywords []string `json:"include_keywords"`
 	ExcludeKeywords []string `json:"exclude_keywords"`
 	URLs            []string `json:"urls"`
@@ -63,7 +63,6 @@ type State struct {
 
 type FeedState struct {
 	LastLink     string `json:"last_link"`
-	LastPubDate  string `json:"last_pub_date"`
 	LastModified string `json:"last_modified"`
 	ETag         string `json:"etag"`
 }
@@ -72,7 +71,6 @@ type NotificationItem struct {
 	Title          string
 	Link           string
 	Description    string
-	PubDate        time.Time
 	FeedTitle      string
 	SlackChannelID string
 	EnableMastodon bool
@@ -185,9 +183,7 @@ func loadState(ctx context.Context, client *s3.Client) (*State, error) {
 
 func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*State, error) {
 	newState := &State{Feeds: make(map[string]FeedState)}
-	for k, v := range oldState.Feeds {
-		newState.Feeds[k] = v
-	}
+	maps.Copy(newState.Feeds, oldState.Feeds)
 
 	var errorList []string
 
@@ -195,7 +191,10 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 		excludeWords := append(feedCfg.ExcludeKeywords, appConfig.GlobalExcludeWords...)
 
 		for _, url := range feedCfg.URLs {
-			updatedFeedState, err := processSingleFeed(ctx, url, feedCfg, excludeWords, appConfig.DelayedDomains, delayedStartIndex, newState.Feeds)
+			feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
+			currentState := newState.Feeds[feedKey]
+
+			updatedFeedState, err := processSingleFeed(ctx, url, feedCfg, excludeWords, appConfig.DelayedDomains, currentState)
 			if err != nil {
 				msg := fmt.Sprintf("Failed to process %s: %v", url, err)
 				log.Println(msg)
@@ -203,7 +202,6 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 				continue
 			}
 
-			feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
 			newState.Feeds[feedKey] = *updatedFeedState
 		}
 	}
@@ -228,9 +226,7 @@ func saveState(ctx context.Context, client *s3.Client, state *State) error {
 	return err
 }
 
-func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, delayedDomains []string, delayedStartIndex int, currentFeeds map[string]FeedState) (*FeedState, error) {
-	feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
-	currentState := currentFeeds[feedKey]
+func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, delayedDomains []string, currentState FeedState) (*FeedState, error) {
 
 	feed, respHeaders, statusCode, err := fetchAndParse(url, currentState.LastModified, currentState.ETag)
 	if err != nil {
@@ -245,44 +241,10 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	nextState.LastModified = respHeaders.Get("Last-Modified")
 	nextState.ETag = respHeaders.Get("ETag")
 
-	notifyItems := getNewItemsWithEnrichment(feed.Items, currentState.LastLink, feedCfg.IncludeKeywords, excludeWords, delayedDomains, delayedStartIndex, url)
+	notifyItems := getNewItemsWithEnrichment(feed.Items, currentState.LastLink, feedCfg.IncludeKeywords, excludeWords, delayedDomains, url)
 
-	notificationCount := 0
-	for _, item := range notifyItems {
-		nItem := NotificationItem{
-			Title:          item.Title,
-			Link:           item.Link,
-			Description:    cleanHTML(item.Description),
-			PubDate:        safeParseDate(item.Published),
-			FeedTitle:      feed.Title,
-			SlackChannelID: feedCfg.SlackChannelID,
-			EnableMastodon: feedCfg.EnableMastodon,
-		}
-
-		if err := sendNotifications(ctx, nItem); err != nil {
-			log.Printf("Notification failed for %s: %v", item.Title, err)
-		} else {
-			notificationCount++
-		}
-		time.Sleep(1 * time.Second)
-	}
-
-	if len(notifyItems) > 0 {
-		mostRecent := notifyItems[0]
-		nextState.LastLink = mostRecent.Link
-		if mostRecent.Published != "" {
-			nextState.LastPubDate = mostRecent.Published
-		}
-	} else if currentState.LastLink == "" && len(feed.Items) > 0 {
-		idx := 0
-		if isDelayedDomain(url, delayedDomains) {
-			idx = delayedStartIndex
-		}
-		if idx < len(feed.Items) {
-			nextState.LastLink = feed.Items[idx].Link
-			nextState.LastPubDate = feed.Items[idx].Published
-		}
-	}
+	processNotifications(ctx, notifyItems, feed, feedCfg)
+	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, delayedDomains)
 
 	return &nextState, nil
 }
@@ -343,7 +305,7 @@ func fetchFeedContent(feedURL string, headers map[string]string) ([]byte, http.H
 	return body, resp.Header, resp.StatusCode, err
 }
 
-func getNewItemsWithEnrichment(items []*gofeed.Item, lastLink string, include, exclude []string, delayedDomains []string, delayedStartIndex int, feedURL string) []*gofeed.Item {
+func getNewItemsWithEnrichment(items []*gofeed.Item, lastLink string, include, exclude []string, delayedDomains []string, feedURL string) []*gofeed.Item {
 	var filteredCandidates []*gofeed.Item
 	for _, item := range items {
 		if passesFilters(item, include, exclude) {
@@ -381,6 +343,39 @@ func getNewItemsWithEnrichment(items []*gofeed.Item, lastLink string, include, e
 	return notifyItems
 }
 
+func processNotifications(ctx context.Context, items []*gofeed.Item, feed *gofeed.Feed, feedCfg FeedFilterConfig) {
+	for _, item := range items {
+		nItem := NotificationItem{
+			Title:          item.Title,
+			Link:           item.Link,
+			Description:    cleanHTML(item.Description),
+			FeedTitle:      feed.Title,
+			SlackChannelID: feedCfg.SlackChannelID,
+			EnableMastodon: feedCfg.EnableMastodon,
+		}
+
+		if err := sendNotifications(ctx, nItem); err != nil {
+			log.Printf("Notification failed for %s: %v", item.Title, err)
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, notifyItems []*gofeed.Item, feed *gofeed.Feed, url string, delayedDomains []string) {
+	if len(notifyItems) > 0 {
+		mostRecent := notifyItems[0]
+		nextState.LastLink = mostRecent.Link
+	} else if currentState.LastLink == "" && len(feed.Items) > 0 {
+		idx := 0
+		if isDelayedDomain(url, delayedDomains) {
+			idx = delayedStartIndex
+		}
+		if idx < len(feed.Items) {
+			nextState.LastLink = feed.Items[idx].Link
+		}
+	}
+}
+
 func passesFilters(item *gofeed.Item, include []string, exclude []string) bool {
 	text := strings.ToLower(item.Title + " " + item.Description)
 
@@ -413,19 +408,6 @@ func isDelayedDomain(feedURL string, domains []string) bool {
 		}
 	}
 	return false
-}
-
-func safeParseDate(d string) time.Time {
-	layouts := []string{
-		time.RFC1123Z, time.RFC1123, time.RFC822Z, time.RFC822,
-		time.RFC3339, "Mon, 02 Jan 2006 15:04:05 -0700",
-	}
-	for _, l := range layouts {
-		if t, err := time.Parse(l, d); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
 }
 
 func cleanHTML(htmlContent string) string {
