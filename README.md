@@ -1,197 +1,108 @@
-# RSS Feed Filtering Service
+# RSS Feed Filtering & Notification Service (Push Architecture)
 
-A serverless RSS feed aggregation and filtering service built with Go and AWS Lambda. This service fetches multiple RSS feeds, applies keyword-based filtering, and generates customized RSS feeds based on configurable categories.
+GoとAWS Lambdaで構築されたサーバーレスRSS通知サービスです。
+指定されたRSSフィードを定期的に取得し、フィルタリング条件（キーワード除外・遅延配信など）を適用した後、新しい記事をSlackやMastodonに通知します。
 
-## Features
+## 主な機能
 
-- **Multi-source RSS aggregation**: Combine multiple RSS feeds into a single filtered feed
-- **Keyword filtering**: Include/exclude articles based on configurable keywords
-- **Category-based configuration**: Organize feeds by categories with different filtering rules
-- **Paywall article handling**: Skip the latest article from specific domains (typically paywalled) and wait for it to become free
-- **AWS Lambda deployment**: Serverless architecture with automatic scaling
-- **Local development support**: Run and test locally before deployment
+- **プッシュ型通知**: SlackおよびMastodonへの自動投稿に対応。
+- **フィルタリング**:
+  - 全体除外キーワード（`global_exclude_keywords`）
+  - カテゴリごとの除外/必須キーワード設定
+- **Delayed Notification（遅延配信）**:
+  - 特定のドメイン（例: コミック配信サイト等）に対し、常に「1件古い記事」を通知するロジックを搭載。
+  - 最新記事が有料で、1つ前の記事が無料公開されるようなケースに対応（例: `delayedStartIndex = 1`）。
+- **状態管理**:
+  - S3上の `state.json` に各フィードの最終通知位置（LastLink）や更新日時（LastPubDate）を保存。
+  - 重複通知を防止し、効率的な差分チェックを実現（ETag/Last-Modified対応）。
+- **サーバーレス**: AWS Lambda上で動作し、イベントブリッジ等で定期実行することを想定。
 
-## Architecture
+## 構成
 
-- **Runtime**: Go 1.24.2
-- **Deployment**: AWS Lambda with Function URL
-- **Configuration**: JSON config stored in S3
-- **Dependencies**: AWS SDK v2, gofeed parser
+- **言語**: Go 1.24.2
+- **インフラ**: AWS Lambda (provided.al2023)
+- **設定・状態**: AWS S3 (`config.json`, `state.json`)
 
-## Quick Start
+## 必要要件
 
-### Prerequisites
+- Go 1.24.2+
+- AWS CLI (設定済みであること)
+- 各種トークン（Slack Bot Token, Mastodon Access Token）
 
-- Go 1.24.2 or later
-- AWS CLI configured with appropriate permissions
-- jq (for deployment script)
+## 設定 (Environment Variables)
 
-### Local Development
+本番環境（Lambda）およびローカル実行時に以下の環境変数が必要です。
 
-1. Clone the repository
-2. Install dependencies:
-   ```bash
-   go mod download
-   ```
+| 変数名 | 説明 | 例 |
+|---|---|---|
+| `S3_BUCKET` | 設定/状態ファイルを保存するS3バケット名 | `universal-lambda-config` |
+| `S3_CONFIG_KEY` | 設定ファイルのS3キー | `rss/config.json` |
+| `S3_STATE_KEY` | 状態ファイルのS3キー | `rss/state.json` |
+| `SLACK_BOT_TOKEN` | Slack BotのOAuthトークン | `xoxb-...` |
+| `MASTODON_SERVER` | MastodonインスタンスURL | `https://mstdn.example.com/` |
+| `MASTODON_ACCESS_TOKEN` | Mastodonアクセストークン | `...` |
 
-3. Create configuration file in S3 (see Configuration section)
+## ローカル開発
 
-4. Run locally:
-   ```bash
-   go run main.go <category>
-   ```
-
-### Deployment
-
-Deploy to AWS Lambda using the provided script:
+### 1. セットアップ
 
 ```bash
-# Build and deploy
-./deploy.sh
-
-# Build only (for testing)
-./deploy.sh --build-only
+git clone <repository>
+cd rss
+go mod download
 ```
 
-## Configuration
+### 2. 環境変数の準備
 
-Create a `config.json` file in your S3 bucket with the following structure:
+プロジェクトルートに `.env` ファイルを作成します（`.env.example` を参考にしてください）。
+
+```bash
+cp .env.example .env
+vi .env
+# 各値を設定
+```
+
+### 3. 実行
+
+```bash
+go run main.go
+```
+
+`.env` ファイルが読み込まれ、S3から設定を取得し、RSS取得・フィルタリング・通知（実際に送信されます）が実行されます。
+
+## デプロイ
+
+AWS Lambdaへのデプロイには付属のスクリプトを使用します。
+
+```bash
+./deploy.sh
+```
+
+- ビルド (`bootstrap` バイナリ作成)
+- ZIP圧縮
+- AWS Lambdaへのコード更新 (`aws lambda update-function-code`)
+
+が行われます。
+
+## 設定ファイル仕様 (config.json)
+
+S3に配置するJSON設定ファイルの形式です。
 
 ```json
 {
-    "global_exclude_keywords": ["spam", "ads"],
-    "delayed_domains": ["news-site.invalid"],
+    "global_exclude_keywords": ["PR", "広告"],
+    "delayed_domains": ["https://kimicomi.com"],
     "configs": [
         {
             "category": "tech",
-            "description": "Technology News",
-            "include_keywords": ["programming", "software"],
-            "exclude_keywords": ["gossip"],
-            "urls": [
-                "https://example.invalid/tech-feed.xml",
-                "https://another-site.invalid/rss"
-            ]
+            "description": "技術ニュース",
+            "urls": ["https://example.com/feed.xml"],
+            "slack_channel_id": "C0123456789",
+            "enable_mastodon": true,
+            "exclude_keywords": ["ゴシップ"]
         }
     ]
 }
 ```
 
-### Configuration Options
-
-- `global_exclude_keywords`: Keywords to exclude across all categories
-- `delayed_domains`: Domains where the latest article is skipped (useful for paywalled content that becomes free over time)
-- `configs`: Array of category configurations
-
-## API Usage
-
-Access the deployed Lambda function via its Function URL:
-
-```
-https://your-function-url.example.invalid/?category=tech&token=your-access-token
-```
-
-## Security
-
-- Access token authentication required for all requests
-- S3 bucket permissions for configuration access
-- Lambda execution role with minimal required permissions
-
----
-
-# RSS フィード フィルタリング サービス
-
-Go と AWS Lambda で構築されたサーバーレス RSS フィード集約・フィルタリングサービスです。複数の RSS フィードを取得し、キーワードベースのフィルタリングを適用して、設定可能なカテゴリに基づいてカスタマイズされた RSS フィードを生成します。
-
-## 機能
-
-- **マルチソース RSS 集約**: 複数の RSS フィードを単一のフィルタリングされたフィードに統合
-- **キーワードフィルタリング**: 設定可能なキーワードに基づいて記事を含める/除外する
-- **カテゴリベース設定**: 異なるフィルタリングルールでフィードをカテゴリ別に整理
-- **有料記事対応**: 特定のドメインの最新記事をスキップ（有料記事が時間経過で無料になるのを待つ）
-- **AWS Lambda デプロイメント**: 自動スケーリング機能付きサーバーレスアーキテクチャ
-- **ローカル開発サポート**: デプロイ前にローカルで実行・テスト可能
-
-## アーキテクチャ
-
-- **ランタイム**: Go 1.24.2
-- **デプロイメント**: Function URL 付き AWS Lambda
-- **設定**: S3 に保存された JSON 設定ファイル
-- **依存関係**: AWS SDK v2、gofeed パーサー
-
-## クイックスタート
-
-### 前提条件
-
-- Go 1.24.2 以降
-- 適切な権限で設定された AWS CLI
-- jq（デプロイスクリプト用）
-
-### ローカル開発
-
-1. リポジトリをクローン
-2. 依存関係をインストール:
-   ```bash
-   go mod download
-   ```
-
-3. S3 に設定ファイルを作成（設定セクションを参照）
-
-4. ローカルで実行:
-   ```bash
-   go run main.go <カテゴリ>
-   ```
-
-### デプロイメント
-
-提供されたスクリプトを使用して AWS Lambda にデプロイ:
-
-```bash
-# ビルドとデプロイ
-./deploy.sh
-
-# ビルドのみ（テスト用）
-./deploy.sh --build-only
-```
-
-## 設定
-
-S3 バケットに以下の構造で `config.json` ファイルを作成:
-
-```json
-{
-    "global_exclude_keywords": ["スパム", "広告"],
-    "delayed_domains": ["news-site.invalid"],
-    "configs": [
-        {
-            "category": "tech",
-            "description": "テクノロジーニュース",
-            "include_keywords": ["プログラミング", "ソフトウェア"],
-            "exclude_keywords": ["ゴシップ"],
-            "urls": [
-                "https://example.invalid/tech-feed.xml",
-                "https://another-site.invalid/rss"
-            ]
-        }
-    ]
-}
-```
-
-### 設定オプション
-
-- `global_exclude_keywords`: すべてのカテゴリで除外するキーワード
-- `delayed_domains`: 最新記事をスキップするドメイン（時間経過で有料記事が無料になるサイトに有効）
-- `configs`: カテゴリ設定の配列
-
-## API 使用方法
-
-Function URL 経由でデプロイされた Lambda 関数にアクセス:
-
-```
-https://your-function-url.example.invalid/?category=tech&token=your-access-token
-```
-
-## セキュリティ
-
-- すべてのリクエストにアクセストークン認証が必要
-- 設定アクセス用の S3 バケット権限
-- 最小限の必要権限を持つ Lambda 実行ロール
+- **delayed_domains**: ここに含まれるドメインのフィードは、常に「最新の1つ前」の記事から処理が開始されます（コード内で `delayedStartIndex = 1` 固定）。
