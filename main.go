@@ -79,7 +79,7 @@ type NotificationItem struct {
 }
 
 func main() {
-	if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
+	if isLambda() {
 		lambda.Start(run)
 	} else {
 		if err := run(context.Background()); err != nil {
@@ -88,12 +88,13 @@ func main() {
 	}
 }
 
-func run(ctx context.Context) error {
-	log.Println("Starting RSS Filter Service...")
+func isLambda() bool {
+	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
+}
 
-	// Load .env file if present
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found or error loading it, using process environment variables.")
+func run(ctx context.Context) error {
+	if !isLambda() {
+		godotenv.Load()
 	}
 
 	loadEnvConfig()
@@ -115,17 +116,16 @@ func run(ctx context.Context) error {
 		state = &State{Feeds: make(map[string]FeedState)}
 	}
 
-	updatedState, err := processFeeds(ctx, appConfig, state)
-	if err != nil {
-		log.Printf("Some feeds failed: %v", err)
+	updatedState, processErr := processFeeds(ctx, appConfig, state)
+	if processErr != nil {
+		log.Printf("Some feeds failed: %v", processErr)
 	}
 
 	if err := saveState(ctx, s3Client, updatedState); err != nil {
 		return fmt.Errorf("State save error: %w", err)
 	}
 
-	log.Println("Execution completed successfully.")
-	return nil
+	return processErr
 }
 
 func loadEnvConfig() {
@@ -217,8 +217,6 @@ func saveState(ctx context.Context, client *s3.Client, state *State) error {
 }
 
 func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, delayedDomains []string, delayedStartIndex int, currentFeeds map[string]FeedState) (*FeedState, error) {
-	log.Printf("Processing: %s", url)
-
 	feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
 	currentState := currentFeeds[feedKey]
 
@@ -228,7 +226,6 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	}
 
 	if statusCode == http.StatusNotModified {
-		log.Printf("Not Modified: %s", url)
 		return &currentState, nil
 	}
 
@@ -255,7 +252,6 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 			log.Printf("Notification failed for %s: %v", item.Title, err)
 		} else {
 			notificationCount++
-			log.Printf("Notified: %s", item.Title)
 		}
 		time.Sleep(1 * time.Second)
 	}
@@ -277,7 +273,6 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 		}
 	}
 
-	log.Printf("Processed %s: %d notifications sent.", url, notificationCount)
 	return &nextState, nil
 }
 
@@ -462,8 +457,9 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 	})
 
 	status := fmt.Sprintf("%s\n%s #%s", item.Title, item.Link, item.Category)
-	if len(status) > mastodonMaxStatusLength {
-		status = status[:mastodonMaxStatusLength-3] + "..."
+	runes := []rune(status)
+	if len(runes) > mastodonMaxStatusLength {
+		status = string(runes[:mastodonMaxStatusLength-3]) + "..."
 	}
 
 	_, err := c.PostStatus(ctx, &mastodon.Toot{
