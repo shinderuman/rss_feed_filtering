@@ -79,7 +79,7 @@ type NotificationItem struct {
 }
 
 func (n NotificationItem) Format() string {
-	return fmt.Sprintf(`[%s] %s
+	return fmt.Sprintf(`*[%s] %s*
 %s
 
 %s`,
