@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -34,6 +36,7 @@ const (
 	defaultTimeout          = 10 * time.Second
 	mastodonMaxStatusLength = 500
 	delayedStartIndex       = 1
+	domainDelay             = 500 * time.Millisecond
 )
 
 var (
@@ -200,7 +203,16 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 	for _, feedCfg := range appConfig.Configs {
 		excludeWords := append(feedCfg.ExcludeKeywords, appConfig.GlobalExcludeWords...)
 
-		for _, url := range feedCfg.URLs {
+		sort.Strings(feedCfg.URLs)
+
+		var lastHostname string
+		for i, url := range feedCfg.URLs {
+			currentHostname := getHostname(url)
+			if i > 0 && currentHostname == lastHostname && currentHostname != "" {
+				time.Sleep(domainDelay)
+			}
+			lastHostname = currentHostname
+
 			feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
 			currentState := newState.Feeds[feedKey]
 
@@ -237,6 +249,14 @@ func saveState(ctx context.Context, client *s3.Client, state *State) error {
 		Body:   bytes.NewReader(body),
 	})
 	return err
+}
+
+func getHostname(urlStr string) string {
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, delayedDomains []string, currentState FeedState) (*FeedState, error) {
