@@ -84,29 +84,36 @@ type NotificationItem struct {
 	EnableMastodon bool
 }
 
-func (n NotificationItem) Format() string {
-	return fmt.Sprintf(`*[%s] %s*
+func (n NotificationItem) Format(forSlack bool) string {
+	escape := func(text string) string {
+		replacer := strings.NewReplacer(
+			"&", "&amp;",
+			"<", "&lt;",
+			">", "&gt;",
+			"*", "∗", // Replace asterisk with U+2217 Asterisk Operator to prevent format breaking
+			"_", "＿", // Replace underscore with Fullwidth Low Line
+			"~", "～", // Replace tilde with Fullwidth Tilde
+			"`", "｀", // Replace backtick with Fullwidth Grave Accent
+		)
+		return replacer.Replace(text)
+	}
+
+	format := `[%s] %s
 %s
 
-%s`,
-		escapeSlackText(n.FeedTitle),
-		escapeSlackText(n.Title),
+%s`
+	if forSlack {
+		format = `*<%[3]s|[%[1]s] %[2]s>*
+
+%[4]s`
+	}
+
+	return fmt.Sprintf(format,
+		escape(n.FeedTitle),
+		escape(n.Title),
 		n.Link,
 		n.Description,
 	)
-}
-
-func escapeSlackText(text string) string {
-	replacer := strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		"*", "∗", // Replace asterisk with U+2217 Asterisk Operator to prevent format breaking
-		"_", "＿", // Replace underscore with Fullwidth Low Line
-		"~", "～", // Replace tilde with Fullwidth Tilde
-		"`", "｀", // Replace backtick with Fullwidth Grave Accent
-	)
-	return replacer.Replace(text)
 }
 
 func main() {
@@ -515,7 +522,7 @@ func postToSlack(item NotificationItem) error {
 
 	_, _, err := api.PostMessage(
 		item.SlackChannelID,
-		slack.MsgOptionText(item.Format(), false),
+		slack.MsgOptionText(item.Format(true), false),
 	)
 	return err
 }
@@ -526,7 +533,7 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 		AccessToken: mastodonAccessToken,
 	})
 
-	status := item.Format()
+	status := item.Format(false)
 	runes := []rune(status)
 	if len(runes) > mastodonMaxStatusLength {
 		status = string(runes[:mastodonMaxStatusLength-3]) + "..."
