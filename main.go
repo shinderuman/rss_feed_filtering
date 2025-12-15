@@ -33,12 +33,13 @@ import (
 )
 
 const (
-	userAgent               = "RSS-Filter-Bot/1.0"
-	defaultTimeout          = 10 * time.Second
-	mastodonMaxStatusLength = 500
-	delayedStartIndex       = 1
-	domainDelay             = 500 * time.Millisecond
-	notificationDelay       = 200 * time.Millisecond
+	userAgent                = "RSS-Filter-Bot/1.0"
+	defaultTimeout           = 10 * time.Second
+	mastodonMaxStatusLength  = 500
+	delayedStartIndex        = 1
+	domainDelay              = 500 * time.Millisecond
+	notificationDelay        = 200 * time.Millisecond
+	initialNotificationLimit = 5
 )
 
 var (
@@ -298,6 +299,11 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	nextState.ETag = respHeaders.Get("ETag")
 
 	notifyItems := getNewItemsWithEnrichment(feed.Items, currentState.LastLink, feedCfg.IncludeKeywords, excludeWords, delayedDomains, url)
+
+	if currentState.LastLink == "" && len(notifyItems) > initialNotificationLimit {
+		slog.Info("limiting notifications for new feed", "url", url, "count", len(notifyItems), "limit", initialNotificationLimit)
+		notifyItems = notifyItems[:initialNotificationLimit]
+	}
 
 	if err := processNotifications(ctx, notifyItems, feed, feedCfg); err != nil {
 		return &nextState, err
