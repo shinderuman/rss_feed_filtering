@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -47,6 +48,7 @@ var (
 	slackBotToken       string
 	mastodonServer      string
 	mastodonAccessToken string
+	urlRegex            = regexp.MustCompile(`https?://[^\s]+`)
 )
 
 type Config struct {
@@ -457,7 +459,9 @@ func cleanHTML(htmlContent string) string {
 	if err != nil {
 		return htmlContent
 	}
-	return strings.TrimSpace(doc.Text())
+	text := strings.TrimSpace(doc.Text())
+
+	return urlRegex.ReplaceAllString(text, "")
 }
 
 func sendNotifications(ctx context.Context, item NotificationItem) error {
