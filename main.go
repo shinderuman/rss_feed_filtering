@@ -89,11 +89,24 @@ func (n NotificationItem) Format() string {
 %s
 
 %s`,
-		n.FeedTitle,
-		n.Title,
+		escapeSlackText(n.FeedTitle),
+		escapeSlackText(n.Title),
 		n.Link,
 		n.Description,
 	)
+}
+
+func escapeSlackText(text string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		"*", "∗", // Replace asterisk with U+2217 Asterisk Operator to prevent format breaking
+		"_", "＿", // Replace underscore with Fullwidth Low Line
+		"~", "～", // Replace tilde with Fullwidth Tilde
+		"`", "｀", // Replace backtick with Fullwidth Grave Accent
+	)
+	return replacer.Replace(text)
 }
 
 func main() {
