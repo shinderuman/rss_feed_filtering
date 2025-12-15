@@ -222,8 +222,6 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 	newState := &State{Feeds: make(map[string]FeedState)}
 	maps.Copy(newState.Feeds, oldState.Feeds)
 
-	var errorList []string
-
 	for _, feedCfg := range appConfig.Configs {
 		excludeWords := append(feedCfg.ExcludeKeywords, appConfig.GlobalExcludeWords...)
 
@@ -247,7 +245,6 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 					"url", url,
 					"error", err,
 				)
-				errorList = append(errorList, fmt.Sprintf("Failed to process %s: %v", url, err))
 				continue
 			}
 
@@ -255,9 +252,6 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 		}
 	}
 
-	if len(errorList) > 0 {
-		return newState, fmt.Errorf("%d errors encountered", len(errorList))
-	}
 	return newState, nil
 }
 
