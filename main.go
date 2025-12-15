@@ -38,8 +38,34 @@ const (
 	mastodonMaxStatusLength  = 500
 	delayedStartIndex        = 1
 	domainDelay              = 500 * time.Millisecond
-	notificationDelay        = 200 * time.Millisecond
+	notificationDelay        = 200 * time.Millisecond // Initial notification limit for new feeds
 	initialNotificationLimit = 5
+
+	// 1: FeedTitle, 2: Title, 3: Link, 4: Description, 5: PreviousTitle, 6: PreviousLink
+	slackFormatDelayed = `*<%[6]s|[%[1]s] %[5]s>*
+
+*<%[3]s|[%[1]s] %[2]s>*
+
+%[4]s`
+
+	slackFormatNormal = `*<%[3]s|[%[1]s] %[2]s>*
+
+%[4]s`
+
+	mastodonFormatDelayed = `[%[1]s]
+
+%[5]s
+%[6]s
+
+%[2]s
+%[3]s
+
+%[4]s`
+
+	mastodonFormatNormal = `[%[1]s] %[2]s
+%[3]s
+
+%[4]s`
 )
 
 var (
@@ -83,30 +109,34 @@ type NotificationItem struct {
 	FeedTitle      string
 	SlackChannelID string
 	EnableMastodon bool
+	PreviousTitle  string
+	PreviousLink   string
 }
 
 func (n NotificationItem) Format(forSlack bool) string {
+	d := mastodonFormatDelayed
+	nm := mastodonFormatNormal
+	if forSlack {
+		d = slackFormatDelayed
+		nm = slackFormatNormal
+	}
+
 	escape := func(text string) string {
 		replacer := strings.NewReplacer(
 			"&", "&amp;",
 			"<", "&lt;",
 			">", "&gt;",
-			"*", "∗", // Replace asterisk with U+2217 Asterisk Operator to prevent format breaking
-			"_", "＿", // Replace underscore with Fullwidth Low Line
-			"~", "～", // Replace tilde with Fullwidth Tilde
-			"`", "｀", // Replace backtick with Fullwidth Grave Accent
+			"*", "∗",
+			"_", "＿",
+			"~", "～",
+			"`", "｀",
 		)
 		return replacer.Replace(text)
 	}
 
-	format := `[%s] %s
-%s
-
-%s`
-	if forSlack {
-		format = `*<%[3]s|[%[1]s] %[2]s>*
-
-%[4]s`
+	format := nm
+	if n.PreviousLink != "" {
+		format = d
 	}
 
 	return fmt.Sprintf(format,
@@ -114,6 +144,8 @@ func (n NotificationItem) Format(forSlack bool) string {
 		escape(n.Title),
 		n.Link,
 		n.Description,
+		escape(n.PreviousTitle),
+		n.PreviousLink,
 	)
 }
 
@@ -292,14 +324,14 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	nextState.LastModified = respHeaders.Get("Last-Modified")
 	nextState.ETag = respHeaders.Get("ETag")
 
-	notifyItems := getNewItemsWithEnrichment(feed.Items, currentState.LastLink, feedCfg.IncludeKeywords, excludeWords, delayedDomains, url)
+	notifyItems := getNotificationItems(feed, feedCfg, currentState.LastLink, excludeWords, delayedDomains, url)
 
 	if currentState.LastLink == "" && len(notifyItems) > initialNotificationLimit {
 		slog.Info("limiting notifications for new feed", "url", url, "count", len(notifyItems), "limit", initialNotificationLimit)
 		notifyItems = notifyItems[:initialNotificationLimit]
 	}
 
-	if err := processNotifications(ctx, notifyItems, feed, feedCfg); err != nil {
+	if err := sendNotificationItems(ctx, notifyItems); err != nil {
 		return &nextState, err
 	}
 	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, delayedDomains)
@@ -363,10 +395,10 @@ func fetchFeedContent(feedURL string, headers map[string]string) ([]byte, http.H
 	return body, resp.Header, resp.StatusCode, err
 }
 
-func getNewItemsWithEnrichment(items []*gofeed.Item, lastLink string, include, exclude []string, delayedDomains []string, feedURL string) []*gofeed.Item {
+func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, lastLink string, exclude []string, delayedDomains []string, feedURL string) []NotificationItem {
 	var filteredCandidates []*gofeed.Item
-	for _, item := range items {
-		if passesFilters(item, include, exclude) {
+	for _, item := range feed.Items {
+		if passesFilters(item, feedCfg.IncludeKeywords, exclude) {
 			filteredCandidates = append(filteredCandidates, item)
 		}
 	}
@@ -377,7 +409,7 @@ func getNewItemsWithEnrichment(items []*gofeed.Item, lastLink string, include, e
 		startIndex = delayedStartIndex
 	}
 
-	var notifyItems []*gofeed.Item
+	var notifyItems []NotificationItem
 	for i := startIndex; i < len(filteredCandidates); i++ {
 		item := filteredCandidates[i]
 
@@ -385,25 +417,6 @@ func getNewItemsWithEnrichment(items []*gofeed.Item, lastLink string, include, e
 			break
 		}
 
-		if isDelayed {
-			if i > 0 {
-				item.Published = filteredCandidates[i-1].Published
-			}
-
-			if i+1 < len(filteredCandidates) {
-				nextEntry := filteredCandidates[i+1]
-				item.Description = fmt.Sprintf("%s\n\n前回: <a href=\"%s\">%s</a>", item.Description, nextEntry.Link, nextEntry.Title)
-			}
-		}
-
-		notifyItems = append(notifyItems, item)
-	}
-	return notifyItems
-}
-
-func processNotifications(ctx context.Context, items []*gofeed.Item, feed *gofeed.Feed, feedCfg FeedFilterConfig) error {
-	var errs []string
-	for _, item := range items {
 		nItem := NotificationItem{
 			Title:          item.Title,
 			Link:           item.Link,
@@ -413,7 +426,23 @@ func processNotifications(ctx context.Context, items []*gofeed.Item, feed *gofee
 			EnableMastodon: feedCfg.EnableMastodon,
 		}
 
-		if err := sendNotifications(ctx, nItem); err != nil {
+		if isDelayed {
+			if i+1 < len(filteredCandidates) {
+				prevEntry := filteredCandidates[i+1]
+				nItem.PreviousTitle = prevEntry.Title
+				nItem.PreviousLink = prevEntry.Link
+			}
+		}
+
+		notifyItems = append(notifyItems, nItem)
+	}
+	return notifyItems
+}
+
+func sendNotificationItems(ctx context.Context, items []NotificationItem) error {
+	var errs []string
+	for _, item := range items {
+		if err := sendNotifications(ctx, item); err != nil {
 			errs = append(errs, fmt.Sprintf("Notification failed for %s: %v", item.Title, err))
 		}
 		time.Sleep(notificationDelay)
@@ -425,7 +454,7 @@ func processNotifications(ctx context.Context, items []*gofeed.Item, feed *gofee
 	return nil
 }
 
-func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, notifyItems []*gofeed.Item, feed *gofeed.Feed, url string, delayedDomains []string) {
+func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, notifyItems []NotificationItem, feed *gofeed.Feed, url string, delayedDomains []string) {
 	if len(notifyItems) > 0 {
 		mostRecent := notifyItems[0]
 		nextState.LastLink = mostRecent.Link
