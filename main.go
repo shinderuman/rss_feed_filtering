@@ -37,6 +37,7 @@ const (
 	mastodonMaxStatusLength = 500
 	delayedStartIndex       = 1
 	domainDelay             = 500 * time.Millisecond
+	notificationDelay       = 200 * time.Millisecond
 )
 
 var (
@@ -393,7 +394,7 @@ func processNotifications(ctx context.Context, items []*gofeed.Item, feed *gofee
 		if err := sendNotifications(ctx, nItem); err != nil {
 			errs = append(errs, fmt.Sprintf("Notification failed for %s: %v", item.Title, err))
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(notificationDelay)
 	}
 
 	if len(errs) > 0 {
