@@ -270,10 +270,16 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 			feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
 			currentState := newState.Feeds[feedKey]
 
-			updatedFeedState, err := processSingleFeed(ctx, url, feedCfg, excludeWords, appConfig.DelayedDomains, currentState)
+			updatedFeedState, statusCode, err := processSingleFeed(ctx, url, feedCfg, excludeWords, appConfig.DelayedDomains, currentState)
 			if err != nil {
+				// Check if error is HTTP 429 (Too Many Requests)
+				errorType := "fetch_error"
+				if statusCode == http.StatusTooManyRequests {
+					errorType = "rate_limit_error"
+				}
+
 				slog.Error("Failed to process feed",
-					"error_type", "fetch_error",
+					"error_type", errorType,
 					"url", url,
 					"error", err,
 				)
@@ -309,15 +315,15 @@ func getHostname(urlStr string) string {
 	return u.Hostname()
 }
 
-func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, delayedDomains []string, currentState FeedState) (*FeedState, error) {
+func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, delayedDomains []string, currentState FeedState) (*FeedState, int, error) {
 
 	feed, respHeaders, statusCode, err := fetchAndParse(url, currentState.LastModified, currentState.ETag)
 	if err != nil {
-		return nil, err
+		return nil, statusCode, err
 	}
 
 	if statusCode == http.StatusNotModified {
-		return &currentState, nil
+		return &currentState, statusCode, nil
 	}
 
 	nextState := currentState
@@ -332,11 +338,11 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	}
 
 	if err := sendNotificationItems(ctx, notifyItems); err != nil {
-		return &nextState, err
+		return &nextState, statusCode, err
 	}
 	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, delayedDomains)
 
-	return &nextState, nil
+	return &nextState, statusCode, nil
 }
 
 func fetchAndParse(url string, lastModified, etag string) (*gofeed.Feed, http.Header, int, error) {
@@ -350,7 +356,7 @@ func fetchAndParse(url string, lastModified, etag string) (*gofeed.Feed, http.He
 
 	content, respHeaders, statusCode, err := fetchFeedContent(url, headers)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, statusCode, err
 	}
 	if statusCode == http.StatusNotModified {
 		return nil, respHeaders, statusCode, nil
