@@ -172,7 +172,7 @@ func isLambda() bool {
 
 func run(ctx context.Context) error {
 	if !isLambda() {
-		godotenv.Load()
+		_ = godotenv.Load()
 	}
 
 	loadEnvConfig()
@@ -222,7 +222,7 @@ func loadAppConfig(ctx context.Context, client *s3.Client) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var cfg Config
 	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
@@ -244,7 +244,7 @@ func loadState(ctx context.Context, client *s3.Client) (*State, error) {
 		}
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	var state State
 	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
@@ -395,7 +395,7 @@ func fetchFeedContent(feedURL string, headers map[string]string) ([]byte, http.H
 	if err != nil {
 		return nil, nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode == http.StatusNotModified {
 		return nil, resp.Header, resp.StatusCode, nil
