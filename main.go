@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -40,6 +41,7 @@ const (
 	domainDelay              = 500 * time.Millisecond
 	notificationDelay        = 200 * time.Millisecond // Initial notification limit for new feeds
 	initialNotificationLimit = 5
+	maxSeenLinks             = 100
 
 	// 1: FeedTitle, 2: Title, 3: Link, 4: Description, 5: PreviousTitle, 6: PreviousLink
 	slackFormatDelayed = `*<%[6]s|[%[1]s] %[5]s>*
@@ -97,9 +99,10 @@ type State struct {
 }
 
 type FeedState struct {
-	LastLink     string `json:"last_link"`
-	LastModified string `json:"last_modified"`
-	ETag         string `json:"etag"`
+	LastLink     string   `json:"last_link"`
+	LastModified string   `json:"last_modified"`
+	ETag         string   `json:"etag"`
+	SeenLinks    []string `json:"seen_links"`
 }
 
 type NotificationItem struct {
@@ -330,7 +333,12 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	nextState.LastModified = respHeaders.Get("Last-Modified")
 	nextState.ETag = respHeaders.Get("ETag")
 
-	notifyItems := getNotificationItems(feed, feedCfg, currentState.LastLink, excludeWords, delayedDomains, url)
+	// Migration: If SeenLinks is empty but LastLink exists, initialize it
+	if len(currentState.SeenLinks) == 0 && currentState.LastLink != "" {
+		currentState.SeenLinks = []string{currentState.LastLink}
+	}
+
+	notifyItems := getNotificationItems(feed, feedCfg, currentState.SeenLinks, excludeWords, delayedDomains, url)
 
 	if currentState.LastLink == "" && len(notifyItems) > initialNotificationLimit {
 		slog.Info("limiting notifications for new feed", "url", url, "count", len(notifyItems), "limit", initialNotificationLimit)
@@ -401,7 +409,7 @@ func fetchFeedContent(feedURL string, headers map[string]string) ([]byte, http.H
 	return body, resp.Header, resp.StatusCode, err
 }
 
-func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, lastLink string, exclude []string, delayedDomains []string, feedURL string) []NotificationItem {
+func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks []string, exclude []string, delayedDomains []string, feedURL string) []NotificationItem {
 	var filteredCandidates []*gofeed.Item
 	for _, item := range feed.Items {
 		if passesFilters(item, feedCfg.IncludeKeywords, exclude) {
@@ -419,7 +427,9 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, lastLink 
 	for i := startIndex; i < len(filteredCandidates); i++ {
 		item := filteredCandidates[i]
 
-		if item.Link == lastLink {
+		// If we encounter a link we've seen before, we assume we've reached the point of previous checks.
+		// This is more robust than checking just the single LastLink.
+		if slices.Contains(seenLinks, item.Link) {
 			break
 		}
 
@@ -461,6 +471,7 @@ func sendNotificationItems(ctx context.Context, items []NotificationItem) error 
 }
 
 func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, notifyItems []NotificationItem, feed *gofeed.Feed, url string, delayedDomains []string) {
+	// Update LastLink for backward compatibility or reference
 	if len(notifyItems) > 0 {
 		mostRecent := notifyItems[0]
 		nextState.LastLink = mostRecent.Link
@@ -473,6 +484,27 @@ func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, not
 			nextState.LastLink = feed.Items[idx].Link
 		}
 	}
+
+	// Update SeenLinks
+	// 1. Gather new links from notifyItems (descending order in slice = Newest to Oldest)
+	//    Wait, feed.Items are Newest-First. loop runs 0..N.
+	//    notifyItems are appended in order of appearance (Newest -> Oldest).
+	//    So notifyItems[0] is the Newest.
+	var newLinks []string
+	for _, item := range notifyItems {
+		newLinks = append(newLinks, item.Link)
+	}
+
+	// 2. Prepend new links to existing SeenLinks (so index 0 is always newest)
+	//    Handling potential duplicates if logic wasn't perfect?
+	//    We can just prepend. The dedupe logic in reading prevents adding same things again mostly.
+	combined := append(newLinks, currentState.SeenLinks...)
+
+	// 3. Truncate to maxSeenLinks
+	if len(combined) > maxSeenLinks {
+		combined = combined[:maxSeenLinks]
+	}
+	nextState.SeenLinks = combined
 }
 
 func passesFilters(item *gofeed.Item, include []string, exclude []string) bool {
