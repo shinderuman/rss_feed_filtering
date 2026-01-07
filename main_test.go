@@ -364,3 +364,26 @@ func TestProcessFeeds_ParallelStateUpdate(t *testing.T) {
 		}
 	}
 }
+
+func TestGetNotificationItems_WithMastodonToken(t *testing.T) {
+	feed := &gofeed.Feed{
+		Items: []*gofeed.Item{
+			{Title: "Item 1", Link: "link1"},
+		},
+	}
+
+	cfg := FeedFilterConfig{
+		EnableMastodon:      true,
+		MastodonAccessToken: "custom_token",
+	}
+	seenLinks := []string{}
+
+	items := getNotificationItems(feed, cfg, seenLinks, nil, nil, "")
+
+	if len(items) != 1 {
+		t.Errorf("Expected 1 item, got %d", len(items))
+	}
+	if items[0].MastodonAccessToken != "custom_token" {
+		t.Errorf("Expected token 'custom_token', got '%s'", items[0].MastodonAccessToken)
+	}
+}

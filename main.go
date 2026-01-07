@@ -93,12 +93,13 @@ type Config struct {
 }
 
 type FeedFilterConfig struct {
-	IncludeKeywords   []string `json:"include_keywords"`
-	ExcludeKeywords   []string `json:"exclude_keywords"`
-	URLs              []string `json:"urls"`
-	SlackChannelID    string   `json:"slack_channel_id"`
-	EnableMastodon    bool     `json:"enable_mastodon"`
-	EnableTranslation bool     `json:"enable_translation"`
+	IncludeKeywords     []string `json:"include_keywords"`
+	ExcludeKeywords     []string `json:"exclude_keywords"`
+	URLs                []string `json:"urls"`
+	SlackChannelID      string   `json:"slack_channel_id"`
+	EnableMastodon      bool     `json:"enable_mastodon"`
+	EnableTranslation   bool     `json:"enable_translation"`
+	MastodonAccessToken string   `json:"mastodon_access_token"`
 }
 
 type State struct {
@@ -113,14 +114,15 @@ type FeedState struct {
 }
 
 type NotificationItem struct {
-	Title          string
-	Link           string
-	Description    string
-	FeedTitle      string
-	SlackChannelID string
-	EnableMastodon bool
-	PreviousTitle  string
-	PreviousLink   string
+	Title               string
+	Link                string
+	Description         string
+	FeedTitle           string
+	SlackChannelID      string
+	EnableMastodon      bool
+	MastodonAccessToken string
+	PreviousTitle       string
+	PreviousLink        string
 }
 
 type FeedResult struct {
@@ -519,12 +521,13 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 		}
 
 		nItem := NotificationItem{
-			Title:          item.Title,
-			Link:           item.Link,
-			Description:    cleanHTML(item.Description),
-			FeedTitle:      feed.Title,
-			SlackChannelID: feedCfg.SlackChannelID,
-			EnableMastodon: feedCfg.EnableMastodon,
+			Title:               item.Title,
+			Link:                item.Link,
+			Description:         cleanHTML(item.Description),
+			FeedTitle:           feed.Title,
+			SlackChannelID:      feedCfg.SlackChannelID,
+			EnableMastodon:      feedCfg.EnableMastodon,
+			MastodonAccessToken: feedCfg.MastodonAccessToken,
 		}
 
 		if isDelayed {
@@ -680,9 +683,13 @@ func postToSlack(item NotificationItem) error {
 }
 
 func postToMastodon(ctx context.Context, item NotificationItem) error {
+	accessToken := mastodonAccessToken
+	if item.MastodonAccessToken != "" {
+		accessToken = item.MastodonAccessToken
+	}
 	c := mastodon.NewClient(&mastodon.Config{
 		Server:      mastodonServer,
-		AccessToken: mastodonAccessToken,
+		AccessToken: accessToken,
 	})
 
 	status := item.Format(false)
