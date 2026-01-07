@@ -1,11 +1,26 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/mmcdole/gofeed"
 )
+
+// MockTranslator for testing
+type MockTranslator struct {
+	TranslateFunc func(ctx context.Context, prompt string) (string, error)
+}
+
+func (m *MockTranslator) Translate(ctx context.Context, prompt string) (string, error) {
+	if m.TranslateFunc != nil {
+		return m.TranslateFunc(ctx, prompt)
+	}
+	return "Translated Text", nil
+}
 
 func TestUpdateStateWithLatestItem(t *testing.T) {
 	current := FeedState{
@@ -79,5 +94,55 @@ func TestGetNotificationItems_NoSeen(t *testing.T) {
 
 	if len(items) != 2 {
 		t.Errorf("Expected 2 items, got %d", len(items))
+	}
+}
+
+func TestTranslateNotificationItems(t *testing.T) {
+	ctx := context.Background()
+	items := []NotificationItem{
+		{Title: "Original Title", Description: "Original Description"},
+	}
+
+	// Test Success Case
+	mock := &MockTranslator{
+		TranslateFunc: func(ctx context.Context, prompt string) (string, error) {
+			if strings.Contains(prompt, "Title:") {
+				return "翻訳されたタイトル", nil
+			}
+			if strings.Contains(prompt, "Description:") {
+				return "翻訳された説明", nil
+			}
+			return "", fmt.Errorf("unknown prompt")
+		},
+	}
+
+	translated := translateNotificationItems(ctx, mock, items)
+
+	if len(translated) != 1 {
+		t.Fatalf("Expected 1 item, got %d", len(translated))
+	}
+	if translated[0].Title != "翻訳されたタイトル" {
+		t.Errorf("Expected title '翻訳されたタイトル', got '%s'", translated[0].Title)
+	}
+	if translated[0].Description != "翻訳された説明" {
+		t.Errorf("Expected description '翻訳された説明', got '%s'", translated[0].Description)
+	}
+
+	// Test Error Case (Fallback)
+	errorMock := &MockTranslator{
+		TranslateFunc: func(ctx context.Context, prompt string) (string, error) {
+			return "", fmt.Errorf("API error")
+		},
+	}
+
+	fallbackItems := translateNotificationItems(ctx, errorMock, items)
+	if len(fallbackItems) != 1 {
+		t.Fatalf("Expected 1 item, got %d", len(fallbackItems))
+	}
+	if fallbackItems[0].Title != "Original Title" {
+		t.Errorf("Expected fallback title 'Original Title', got '%s'", fallbackItems[0].Title)
+	}
+	if fallbackItems[0].Description != "Original Description" {
+		t.Errorf("Expected fallback description 'Original Description', got '%s'", fallbackItems[0].Description)
 	}
 }

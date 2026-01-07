@@ -9,26 +9,24 @@
     ],
     "configs": [
         {
-            "category": "tech_news",
-            "description": "Tech News (Posts to default Slack Channel and Mastodon)",
             "include_keywords": ["tech"],
             "exclude_keywords": ["gossip"],
             "urls": [
                 "https://example.invalid/feed.xml"
             ],
             "slack_channel_id": "C012345678",
-            "enable_mastodon": true
+            "enable_mastodon": true,
+            "enable_translation": true
         },
         {
-            "category": "private_alerts",
-            "description": "Private Alerts (Custom Slack Channel, No Mastodon)",
             "include_keywords": ["alert"],
             "exclude_keywords": [],
             "urls": [
                 "https://private.invalid/rss"
             ],
             "slack_channel_id": "C987654321",
-            "enable_mastodon": false
+            "enable_mastodon": false,
+            "enable_translation": false
         }
     ]
 }

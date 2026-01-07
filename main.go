@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -26,16 +28,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/slack-go/slack"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/joho/godotenv"
 	"github.com/mattn/go-mastodon"
 	"github.com/mmcdole/gofeed"
-
-	"github.com/PuerkitoBio/goquery"
 )
 
 const (
 	userAgent                = "RSS-Filter-Bot/1.0"
 	defaultTimeout           = 10 * time.Second
+	anthropicMaxTokens       = 1024
 	mastodonMaxStatusLength  = 500
 	delayedStartIndex        = 1
 	domainDelay              = 500 * time.Millisecond
@@ -71,13 +73,16 @@ const (
 )
 
 var (
-	s3Bucket            string
-	s3ConfigKey         string
-	s3StateKey          string
-	slackBotToken       string
-	mastodonServer      string
-	mastodonAccessToken string
-	urlRegex            = regexp.MustCompile(`https?://[^\s]+`)
+	s3Bucket              string
+	s3ConfigKey           string
+	s3StateKey            string
+	slackBotToken         string
+	mastodonServer        string
+	mastodonAccessToken   string
+	anthropicAuthToken    string
+	anthropicBaseURL      string
+	anthropicDefaultModel string
+	urlRegex              = regexp.MustCompile(`https?://[^\s]+`)
 )
 
 type Config struct {
@@ -87,11 +92,12 @@ type Config struct {
 }
 
 type FeedFilterConfig struct {
-	IncludeKeywords []string `json:"include_keywords"`
-	ExcludeKeywords []string `json:"exclude_keywords"`
-	URLs            []string `json:"urls"`
-	SlackChannelID  string   `json:"slack_channel_id"`
-	EnableMastodon  bool     `json:"enable_mastodon"`
+	IncludeKeywords   []string `json:"include_keywords"`
+	ExcludeKeywords   []string `json:"exclude_keywords"`
+	URLs              []string `json:"urls"`
+	SlackChannelID    string   `json:"slack_channel_id"`
+	EnableMastodon    bool     `json:"enable_mastodon"`
+	EnableTranslation bool     `json:"enable_translation"`
 }
 
 type State struct {
@@ -150,6 +156,33 @@ func (n NotificationItem) Format(forSlack bool) string {
 		escape(n.PreviousTitle),
 		n.PreviousLink,
 	)
+}
+
+type Translator interface {
+	Translate(ctx context.Context, prompt string) (string, error)
+}
+
+type AnthropicTranslator struct {
+	client *anthropic.Client
+	model  string
+}
+
+func (t *AnthropicTranslator) Translate(ctx context.Context, prompt string) (string, error) {
+	message, err := t.client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.Model(t.model),
+		MaxTokens: int64(anthropicMaxTokens),
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if len(message.Content) > 0 {
+		return message.Content[0].Text, nil
+	}
+	return "", fmt.Errorf("no content in response")
 }
 
 func main() {
@@ -212,6 +245,9 @@ func loadEnvConfig() {
 	slackBotToken = os.Getenv("SLACK_BOT_TOKEN")
 	mastodonServer = os.Getenv("MASTODON_SERVER")
 	mastodonAccessToken = os.Getenv("MASTODON_ACCESS_TOKEN")
+	anthropicAuthToken = os.Getenv("ANTHROPIC_AUTH_TOKEN")
+	anthropicBaseURL = os.Getenv("ANTHROPIC_BASE_URL")
+	anthropicDefaultModel = os.Getenv("ANTHROPIC_DEFAULT_MODEL")
 }
 
 func loadAppConfig(ctx context.Context, client *s3.Client) (*Config, error) {
@@ -339,6 +375,18 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	}
 
 	notifyItems := getNotificationItems(feed, feedCfg, currentState.SeenLinks, excludeWords, delayedDomains, url)
+
+	if feedCfg.EnableTranslation {
+		client := anthropic.NewClient(
+			option.WithAPIKey(anthropicAuthToken),
+			option.WithBaseURL(anthropicBaseURL),
+		)
+		translator := &AnthropicTranslator{
+			client: &client,
+			model:  anthropicDefaultModel,
+		}
+		notifyItems = translateNotificationItems(ctx, translator, notifyItems)
+	}
 
 	if currentState.LastLink == "" && len(notifyItems) > initialNotificationLimit {
 		slog.Info("limiting notifications for new feed", "url", url, "count", len(notifyItems), "limit", initialNotificationLimit)
@@ -611,4 +659,28 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 		Visibility: mastodon.VisibilityUnlisted,
 	})
 	return err
+}
+
+func translateNotificationItems(ctx context.Context, translator Translator, items []NotificationItem) []NotificationItem {
+	var translatedItems []NotificationItem
+	for _, item := range items {
+		// Translate Title
+		titlePrompt := fmt.Sprintf("以下のRSSフィードのタイトルを日本語に翻訳してください。結果の文字列のみを返してください。余計な説明は不要です。\n\nTitle: %s", item.Title)
+		if translatedTitle, err := translator.Translate(ctx, titlePrompt); err == nil {
+			item.Title = translatedTitle
+		} else {
+			slog.Error("Failed to translate title", "title", item.Title, "error", err)
+		}
+
+		// Translate Description
+		descPrompt := fmt.Sprintf("以下のRSSフィードの説明文を日本語に翻訳・要約してください。結果の文字列のみを返してください。余計な説明は不要です。\n\nDescription: %s", item.Description)
+		if translatedDesc, err := translator.Translate(ctx, descPrompt); err == nil {
+			item.Description = translatedDesc
+		} else {
+			slog.Error("Failed to translate description", "description", item.Description, "error", err)
+		}
+
+		translatedItems = append(translatedItems, item)
+	}
+	return translatedItems
 }
