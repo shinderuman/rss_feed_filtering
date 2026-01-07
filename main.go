@@ -688,19 +688,23 @@ func translateNotificationItems(ctx context.Context, translator Translator, item
 	var translatedItems []NotificationItem
 	for _, item := range items {
 		// Translate Title
-		titlePrompt := fmt.Sprintf("以下のRSSフィードのタイトルを日本語に翻訳してください。結果の文字列のみを返してください。余計な説明は不要です。\n\nTitle: %s", item.Title)
-		if translatedTitle, err := translator.Translate(ctx, titlePrompt); err == nil {
-			item.Title = translatedTitle
-		} else {
-			slog.Error("Failed to translate title", "title", item.Title, "error", err)
+		if item.Title != "" {
+			titlePrompt := fmt.Sprintf("以下のRSSフィードのタイトルを日本語に翻訳してください。結果の文字列のみを返してください。余計な説明は不要です。\n\nTitle: %s", item.Title)
+			if translatedTitle, err := translator.Translate(ctx, titlePrompt); err == nil {
+				item.Title = translatedTitle
+			} else {
+				slog.Error("Failed to translate title", "title", item.Title, "error", err)
+			}
 		}
 
 		// Translate Description
-		descPrompt := fmt.Sprintf("以下のRSSフィードの説明文を日本語に翻訳・要約してください。結果の文字列のみを返してください。余計な説明は不要です。\n\nDescription: %s", item.Description)
-		if translatedDesc, err := translator.Translate(ctx, descPrompt); err == nil {
-			item.Description = translatedDesc
-		} else {
-			slog.Error("Failed to translate description", "description", item.Description, "error", err)
+		if item.Description != "" {
+			descPrompt := fmt.Sprintf("以下のRSSフィードの説明文を日本語に翻訳・要約してください。結果の文字列のみを返してください。余計な説明は不要です。\n\nDescription: %s", item.Description)
+			if translatedDesc, err := translator.Translate(ctx, descPrompt); err == nil {
+				item.Description = translatedDesc
+			} else {
+				slog.Error("Failed to translate description", "description", item.Description, "error", err)
+			}
 		}
 
 		translatedItems = append(translatedItems, item)
