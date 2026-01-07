@@ -201,3 +201,60 @@ func TestProcessFeeds(t *testing.T) {
 		t.Errorf("Execution took %v, expected less than 600ms (parallel execution failed)", elapsed)
 	}
 }
+
+func TestProcessFeeds_InnerParallelism(t *testing.T) {
+	// Mock RSS Server
+	serverDelay := 200 * time.Millisecond
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverDelay)
+		rss := `<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+<channel>
+ <title>Mock RSS</title>
+ <item>
+  <title>Test Item</title>
+  <link>http://example.com/item</link>
+ </item>
+</channel>
+</rss>`
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, rss)
+	}))
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// Create ONE config with 2 URLs having DIFFERENT HOSTNAMES
+	// URL1: 127.0.0.1 (default ts.URL)
+	// URL2: localhost (modified)
+	url1 := ts.URL
+	url2 := strings.Replace(ts.URL, "127.0.0.1", "localhost", 1)
+
+	appConfig := &Config{
+		Configs: []FeedFilterConfig{
+			{URLs: []string{url1, url2}},
+		},
+	}
+	oldState := &State{
+		Feeds: make(map[string]FeedState),
+	}
+
+	start := time.Now()
+	newState, err := processFeeds(ctx, appConfig, oldState)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("processFeeds failed: %v", err)
+	}
+
+	if len(newState.Feeds) != 2 {
+		t.Errorf("Expected 2 feed states, got %d", len(newState.Feeds))
+	}
+
+	// Verify time
+	// If grouped (same domain): sequential -> 800ms
+	// If separated (diff domain): parallel -> 400ms
+	if elapsed >= 600*time.Millisecond {
+		t.Errorf("Execution took %v, expected less than 600ms (inner parallel execution failed)", elapsed)
+	}
+}

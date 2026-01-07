@@ -326,13 +326,27 @@ func processFeedConfig(ctx context.Context, cfg FeedFilterConfig, appConfig *Con
 	excludeWords := append(cfg.ExcludeKeywords, appConfig.GlobalExcludeWords...)
 	sort.Strings(cfg.URLs)
 
-	var lastHostname string
-	for i, url := range cfg.URLs {
-		currentHostname := getHostname(url)
-		if i > 0 && currentHostname == lastHostname && currentHostname != "" {
+	domainGroups := make(map[string][]string)
+	for _, url := range cfg.URLs {
+		h := getHostname(url)
+		domainGroups[h] = append(domainGroups[h], url)
+	}
+
+	var innerWg sync.WaitGroup
+	for _, urls := range domainGroups {
+		innerWg.Add(1)
+		go processDomainUrls(ctx, urls, cfg, appConfig, oldState, excludeWords, out, &innerWg)
+	}
+	innerWg.Wait()
+}
+
+func processDomainUrls(ctx context.Context, urls []string, cfg FeedFilterConfig, appConfig *Config, oldState *State, excludeWords []string, out chan<- FeedResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for i, url := range urls {
+		if i > 0 {
 			time.Sleep(domainDelay)
 		}
-		lastHostname = currentHostname
 
 		feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
 		currentState := oldState.Feeds[feedKey]
