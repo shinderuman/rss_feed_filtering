@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -256,5 +257,110 @@ func TestProcessFeeds_InnerParallelism(t *testing.T) {
 	// If separated (diff domain): parallel -> 400ms
 	if elapsed >= 600*time.Millisecond {
 		t.Errorf("Execution took %v, expected less than 600ms (inner parallel execution failed)", elapsed)
+	}
+}
+
+func TestProcessFeeds_ParallelStateUpdate(t *testing.T) {
+	// 1. Setup Mock Servers
+	// Server 1: Returns a NEW item (Success)
+	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rss := `<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+<channel>
+ <title>Mock RSS 1</title>
+ <item>
+  <title>New Item 1</title>
+  <link>http://example.com/new1</link>
+ </item>
+</channel>
+</rss>`
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, rss)
+	}))
+	defer ts1.Close()
+
+	// Server 2: Returns 500 Error (Failure)
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts2.Close()
+
+	// Server 3: Returns NEW item (Success)
+	ts3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rss := `<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+<channel>
+ <title>Mock RSS 3</title>
+ <item>
+  <title>New Item 3</title>
+  <link>http://example.com/new3</link>
+ </item>
+</channel>
+</rss>`
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, rss)
+	}))
+	defer ts3.Close()
+
+	// 2. Setup Config and Old State
+	ctx := context.Background()
+	appConfig := &Config{
+		Configs: []FeedFilterConfig{
+			{URLs: []string{ts1.URL, ts2.URL}}, // Group 1 (Mixed success/fail)
+			{URLs: []string{ts3.URL}},          // Group 2 (Success)
+		},
+	}
+
+	// Compute keys
+	key1 := fmt.Sprintf("%x", md5.Sum([]byte(ts1.URL)))
+	key2 := fmt.Sprintf("%x", md5.Sum([]byte(ts2.URL)))
+	key3 := fmt.Sprintf("%x", md5.Sum([]byte(ts3.URL)))
+
+	oldState := &State{
+		Feeds: map[string]FeedState{
+			key1: {SeenLinks: []string{"old1"}},
+			key2: {SeenLinks: []string{"old2"}}, // Should be preserved
+			key3: {SeenLinks: []string{"old3"}},
+		},
+	}
+
+	// 3. Run
+	newState, _ := processFeeds(ctx, appConfig, oldState)
+
+	// 4. Verify
+
+	// Check TS1 (Updated)
+	if state, ok := newState.Feeds[key1]; !ok {
+		t.Errorf("Key1 missing from state")
+	} else {
+		if state.LastLink != "http://example.com/new1" {
+			t.Errorf("Key1 LastLink not updated. Got: %s", state.LastLink)
+		}
+		if len(state.SeenLinks) < 2 || state.SeenLinks[0] != "http://example.com/new1" {
+			t.Errorf("Key1 SeenLinks not updated correctly. Got: %v", state.SeenLinks)
+		}
+	}
+
+	// Check TS2 (Failed, should be preserved)
+	if state, ok := newState.Feeds[key2]; !ok {
+		t.Errorf("Key2 missing from state")
+	} else {
+		// Should match old state exactly?
+		// Or effectively match.
+		if len(state.SeenLinks) != 1 || state.SeenLinks[0] != "old2" {
+			t.Errorf("Key2 data corrupted or changed. Got: %v", state.SeenLinks)
+		}
+	}
+
+	// Check TS3 (Updated)
+	if state, ok := newState.Feeds[key3]; !ok {
+		t.Errorf("Key3 missing from state")
+	} else {
+		if state.LastLink != "http://example.com/new3" {
+			t.Errorf("Key3 LastLink not updated. Got: %s", state.LastLink)
+		}
+		if len(state.SeenLinks) < 2 || state.SeenLinks[0] != "http://example.com/new3" {
+			t.Errorf("Key3 SeenLinks not updated correctly. Got: %v", state.SeenLinks)
+		}
 	}
 }
