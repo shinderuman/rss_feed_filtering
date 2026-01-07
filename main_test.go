@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mmcdole/gofeed"
 )
@@ -144,5 +147,57 @@ func TestTranslateNotificationItems(t *testing.T) {
 	}
 	if fallbackItems[0].Description != "Original Description" {
 		t.Errorf("Expected fallback description 'Original Description', got '%s'", fallbackItems[0].Description)
+	}
+}
+
+func TestProcessFeeds(t *testing.T) {
+	// Mock RSS Server with delay to verify parallelism
+	serverDelay := 200 * time.Millisecond
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(serverDelay)
+		rss := `<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0">
+<channel>
+ <title>Mock RSS</title>
+ <item>
+  <title>Test Item</title>
+  <link>http://example.com/item</link>
+ </item>
+</channel>
+</rss>`
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, rss)
+	}))
+	defer ts.Close()
+
+	ctx := context.Background()
+	// Create 2 configs to trigger 2 goroutines
+	appConfig := &Config{
+		Configs: []FeedFilterConfig{
+			{URLs: []string{ts.URL}},
+			{URLs: []string{ts.URL + "/2"}},
+		},
+	}
+	oldState := &State{
+		Feeds: map[string]FeedState{},
+	}
+
+	start := time.Now()
+	newState, err := processFeeds(ctx, appConfig, oldState)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("processFeeds failed: %v", err)
+	}
+
+	if len(newState.Feeds) != 2 {
+		t.Errorf("Expected 2 feed states, got %d", len(newState.Feeds))
+	}
+
+	// If sequential: (200ms server + 200ms notification) * 2 = 800ms
+	// If parallel: 200ms server + 200ms notification = 400ms (plus overhead)
+	// We assert it is significantly faster than sequential.
+	if elapsed >= 600*time.Millisecond {
+		t.Errorf("Execution took %v, expected less than 600ms (parallel execution failed)", elapsed)
 	}
 }

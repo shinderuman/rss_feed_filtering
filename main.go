@@ -17,6 +17,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -120,6 +121,11 @@ type NotificationItem struct {
 	EnableMastodon bool
 	PreviousTitle  string
 	PreviousLink   string
+}
+
+type FeedResult struct {
+	Key   string
+	State FeedState
 }
 
 func (n NotificationItem) Format(forSlack bool) string {
@@ -293,43 +299,60 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 	newState := &State{Feeds: make(map[string]FeedState)}
 	maps.Copy(newState.Feeds, oldState.Feeds)
 
+	resultCh := make(chan FeedResult, len(appConfig.Configs)*5)
+
+	var wg sync.WaitGroup
+
 	for _, feedCfg := range appConfig.Configs {
-		excludeWords := append(feedCfg.ExcludeKeywords, appConfig.GlobalExcludeWords...)
+		wg.Add(1)
+		go processFeedConfig(ctx, feedCfg, appConfig, oldState, resultCh, &wg)
+	}
 
-		sort.Strings(feedCfg.URLs)
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
 
-		var lastHostname string
-		for i, url := range feedCfg.URLs {
-			currentHostname := getHostname(url)
-			if i > 0 && currentHostname == lastHostname && currentHostname != "" {
-				time.Sleep(domainDelay)
-			}
-			lastHostname = currentHostname
-
-			feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
-			currentState := newState.Feeds[feedKey]
-
-			updatedFeedState, statusCode, err := processSingleFeed(ctx, url, feedCfg, excludeWords, appConfig.DelayedDomains, currentState)
-			if err != nil {
-				// Check if error is HTTP 429 (Too Many Requests)
-				errorType := "fetch_error"
-				if statusCode == http.StatusTooManyRequests {
-					errorType = "rate_limit_error"
-				}
-
-				slog.Error("Failed to process feed",
-					"error_type", errorType,
-					"url", url,
-					"error", err,
-				)
-				continue
-			}
-
-			newState.Feeds[feedKey] = *updatedFeedState
-		}
+	for res := range resultCh {
+		newState.Feeds[res.Key] = res.State
 	}
 
 	return newState, nil
+}
+
+func processFeedConfig(ctx context.Context, cfg FeedFilterConfig, appConfig *Config, oldState *State, out chan<- FeedResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	excludeWords := append(cfg.ExcludeKeywords, appConfig.GlobalExcludeWords...)
+	sort.Strings(cfg.URLs)
+
+	var lastHostname string
+	for i, url := range cfg.URLs {
+		currentHostname := getHostname(url)
+		if i > 0 && currentHostname == lastHostname && currentHostname != "" {
+			time.Sleep(domainDelay)
+		}
+		lastHostname = currentHostname
+
+		feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
+		currentState := oldState.Feeds[feedKey]
+
+		updatedFeedState, statusCode, err := processSingleFeed(ctx, url, cfg, excludeWords, appConfig.DelayedDomains, currentState)
+
+		if err != nil {
+			errorType := "fetch_error"
+			if statusCode == http.StatusTooManyRequests {
+				errorType = "rate_limit_error"
+			}
+			slog.Error("Failed to process feed", "error_type", errorType, "url", url, "error", err)
+			continue
+		}
+
+		out <- FeedResult{
+			Key:   feedKey,
+			State: *updatedFeedState,
+		}
+	}
 }
 
 func saveState(ctx context.Context, client *s3.Client, state *State) error {
@@ -376,6 +399,11 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 
 	notifyItems := getNotificationItems(feed, feedCfg, currentState.SeenLinks, excludeWords, delayedDomains, url)
 
+	if currentState.LastLink == "" && len(notifyItems) > initialNotificationLimit {
+		slog.Info("limiting notifications for new feed", "url", url, "count", len(notifyItems), "limit", initialNotificationLimit)
+		notifyItems = notifyItems[:initialNotificationLimit]
+	}
+
 	if feedCfg.EnableTranslation {
 		client := anthropic.NewClient(
 			option.WithAPIKey(anthropicAuthToken),
@@ -386,11 +414,6 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 			model:  anthropicDefaultModel,
 		}
 		notifyItems = translateNotificationItems(ctx, translator, notifyItems)
-	}
-
-	if currentState.LastLink == "" && len(notifyItems) > initialNotificationLimit {
-		slog.Info("limiting notifications for new feed", "url", url, "count", len(notifyItems), "limit", initialNotificationLimit)
-		notifyItems = notifyItems[:initialNotificationLimit]
 	}
 
 	if err := sendNotificationItems(ctx, notifyItems); err != nil {
