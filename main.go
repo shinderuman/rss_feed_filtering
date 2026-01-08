@@ -803,8 +803,11 @@ func executeWithRetry(ctx context.Context, op func() (string, error)) (string, e
 
 func shouldRetry(err error) bool {
 	var apiErr *anthropic.Error
-	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests {
-		return true
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case http.StatusTooManyRequests, http.StatusBadGateway:
+			return true
+		}
 	}
 
 	var netErr interface{ Timeout() bool }

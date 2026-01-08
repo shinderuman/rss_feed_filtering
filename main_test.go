@@ -704,3 +704,57 @@ func TestAnthropicTranslator_Translate_Retry429(t *testing.T) {
 		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
 	}
 }
+
+func TestAnthropicTranslator_Translate_Retry502(t *testing.T) {
+	// 1. Mock server that returns 502 twice, then 200
+	var attempts int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		if attempts <= 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			// Anthropic error format for 502
+			w.Write([]byte(`{"type":"error","error":{"type":"api_error","message":"Bad Gateway"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"type":"message","id":"msg_123","role":"assistant","content":[{"type":"text","text":"Success"}]}`))
+	}))
+	defer ts.Close()
+
+	// 2. Client setup
+	client := anthropic.NewClient(
+		option.WithAPIKey("dummy"),
+		option.WithBaseURL(ts.URL),
+		option.WithHTTPClient(&http.Client{Timeout: 1 * time.Second}),
+		option.WithMaxRetries(0), // Ensure we rely on our own retry logic
+	)
+
+	translator := &AnthropicTranslator{
+		client: &client,
+		model:  "claude-test",
+	}
+
+	// 3. Execution
+	start := time.Now()
+	res, err := translator.Translate(context.Background(), "test")
+	duration := time.Since(start)
+
+	// 4. Verification
+	if err != nil {
+		t.Fatalf("Expected success, got error: %v", err)
+	}
+	if res != "Success" {
+		t.Errorf("Expected 'Success', got '%s'", res)
+	}
+
+	// Expected Timing:
+	// Attempt 1 (0s): 502 -> Sleep 3s
+	// Attempt 2 (3s): 502 -> Sleep 6s
+	// Attempt 3 (9s): 200 -> Return
+	// Total minimum time: 9s
+	expectedMin := 9 * time.Second
+	if duration < expectedMin {
+		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
+	}
+}
