@@ -105,6 +105,28 @@ func TestGetNotificationItems_NoSeen(t *testing.T) {
 	}
 }
 
+func TestGetNotificationItems_EmptyFiltering(t *testing.T) {
+	feed := &gofeed.Feed{
+		Items: []*gofeed.Item{
+			{Title: "Valid Item", Link: "link1", Description: "Desc"},
+			{Title: "", Link: "link2", Description: ""},       // Should be filtered
+			{Title: "", Link: "link3", Description: " <br> "}, // Should be filtered (empty after clean)
+		},
+	}
+
+	cfg := FeedFilterConfig{}
+	seenLinks := []string{}
+
+	items := getNotificationItems(feed, cfg, seenLinks, nil, nil, "")
+
+	if len(items) != 1 {
+		t.Errorf("Expected 1 item, got %d", len(items))
+	}
+	if items[0].Link != "link1" {
+		t.Errorf("Expected only valid item (link1), got %s", items[0].Link)
+	}
+}
+
 func TestTranslateNotificationItems(t *testing.T) {
 	ctx := context.Background()
 	items := []NotificationItem{
@@ -114,13 +136,10 @@ func TestTranslateNotificationItems(t *testing.T) {
 	// Test Success Case
 	mock := &MockTranslator{
 		TranslateFunc: func(ctx context.Context, prompt string) (string, error) {
-			if strings.Contains(prompt, "Title:") {
-				return "翻訳されたタイトル", nil
+			if strings.Contains(prompt, "Title:") && strings.Contains(prompt, "Description:") {
+				return `{"title": "翻訳されたタイトル", "description": "翻訳された説明"}`, nil
 			}
-			if strings.Contains(prompt, "Description:") {
-				return "翻訳された説明", nil
-			}
-			return "", fmt.Errorf("unknown prompt")
+			return "", fmt.Errorf("unknown prompt structure")
 		},
 	}
 
@@ -136,7 +155,7 @@ func TestTranslateNotificationItems(t *testing.T) {
 		t.Errorf("Expected description '翻訳された説明', got '%s'", translated[0].Description)
 	}
 
-	// Test Error Case (Fallback)
+	// Test Error Case (API Error)
 	errorMock := &MockTranslator{
 		TranslateFunc: func(ctx context.Context, prompt string) (string, error) {
 			return "", fmt.Errorf("API error")
@@ -150,8 +169,19 @@ func TestTranslateNotificationItems(t *testing.T) {
 	if fallbackItems[0].Title != "Original Title" {
 		t.Errorf("Expected fallback title 'Original Title', got '%s'", fallbackItems[0].Title)
 	}
-	if fallbackItems[0].Description != "Original Description" {
-		t.Errorf("Expected fallback description 'Original Description', got '%s'", fallbackItems[0].Description)
+
+	// Test Error Case (JSON Unmarshal Error)
+	jsonErrorMock := &MockTranslator{
+		TranslateFunc: func(ctx context.Context, prompt string) (string, error) {
+			return `INVALID JSON`, nil
+		},
+	}
+	jsonFallbackItems := translateNotificationItems(ctx, jsonErrorMock, items)
+	if len(jsonFallbackItems) != 1 {
+		t.Fatalf("Expected 1 item, got %d", len(jsonFallbackItems))
+	}
+	if jsonFallbackItems[0].Title != "Original Title" {
+		t.Errorf("Expected fallback title 'Original Title' on JSON error, got '%s'", jsonFallbackItems[0].Title)
 	}
 }
 

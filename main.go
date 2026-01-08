@@ -72,6 +72,25 @@ const (
 %[3]s
 
 %[4]s`
+
+	translationPromptTemplate = `あなたはRSSフィードの翻訳アシスタントです。
+以下の <input> タグ内のテキストを日本語に翻訳・要約してください。
+結果は必ず <json_schema> で定義されたJSONフォーマットのみで返してください。
+Markdownコードブロック（` + "```json" + `など）や、JSON以外のテキスト（挨拶や説明など）は一切含めないでください。
+
+<json_schema>
+{
+  "title": "翻訳されたタイトル（入力が空の場合は空文字）",
+  "description": "翻訳・要約された説明文（入力が空の場合は空文字）"
+}
+</json_schema>
+
+<input>
+Title: %s
+Description: %s
+</input>
+
+入力のTitleまたはDescriptionが空（あるいは意味を持たない文字列）の場合、出力JSONの対応するフィールドは必ず空文字 ("") にしてください。決して内容を捏造しないでください。`
 )
 
 var (
@@ -524,10 +543,15 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 			break
 		}
 
+		cleanDesc := cleanHTML(item.Description)
+		if item.Title == "" && cleanDesc == "" {
+			continue
+		}
+
 		nItem := NotificationItem{
 			Title:               item.Title,
 			Link:                item.Link,
-			Description:         cleanHTML(item.Description),
+			Description:         cleanDesc,
 			FeedTitle:           feed.Title,
 			SlackChannelID:      feedCfg.SlackChannelID,
 			EnableMastodon:      feedCfg.EnableMastodon,
@@ -709,26 +733,34 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 }
 
 func translateNotificationItems(ctx context.Context, translator Translator, items []NotificationItem) []NotificationItem {
+	type TranslationResponse struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+	}
+
 	var translatedItems []NotificationItem
 	for _, item := range items {
-		// Translate Title
-		if item.Title != "" {
-			titlePrompt := fmt.Sprintf("以下のRSSフィードのタイトルを日本語に翻訳してください。結果の文字列のみを返してください。余計な説明は不要です。\n\nTitle: %s", item.Title)
-			if translatedTitle, err := translator.Translate(ctx, titlePrompt); err == nil {
-				item.Title = translatedTitle
-			} else {
-				slog.Error("Failed to translate title", "title", item.Title, "error", err)
-			}
+		prompt := fmt.Sprintf(translationPromptTemplate, item.Title, item.Description)
+
+		resp, err := translator.Translate(ctx, prompt)
+		if err != nil {
+			slog.Error("Failed to translate item", "title", item.Title, "error", err)
+			translatedItems = append(translatedItems, item)
+			continue
 		}
 
-		// Translate Description
-		if item.Description != "" {
-			descPrompt := fmt.Sprintf("以下のRSSフィードの説明文を日本語に翻訳・要約してください。結果の文字列のみを返してください。余計な説明は不要です。\n\nDescription: %s", item.Description)
-			if translatedDesc, err := translator.Translate(ctx, descPrompt); err == nil {
-				item.Description = translatedDesc
-			} else {
-				slog.Error("Failed to translate description", "description", item.Description, "error", err)
-			}
+		var translationResp TranslationResponse
+		if err := json.Unmarshal([]byte(resp), &translationResp); err != nil {
+			slog.Error("Failed to unmarshal translation response", "response", resp, "error", err)
+			translatedItems = append(translatedItems, item)
+			continue
+		}
+
+		if translationResp.Title != "" {
+			item.Title = translationResp.Title
+		}
+		if translationResp.Description != "" {
+			item.Description = translationResp.Description
 		}
 
 		translatedItems = append(translatedItems, item)
