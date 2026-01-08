@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -27,25 +28,25 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/slack-go/slack"
-
-	"github.com/PuerkitoBio/goquery"
 	"github.com/joho/godotenv"
 	"github.com/mattn/go-mastodon"
 	"github.com/mmcdole/gofeed"
+	"github.com/slack-go/slack"
 )
 
 const (
-	userAgent                = "RSS-Filter-Bot/1.0"
-	defaultTimeout           = 10 * time.Second
-	anthropicMaxTokens       = 1024
-	mastodonMaxStatusLength  = 500
-	delayedStartIndex        = 1
-	domainDelay              = 500 * time.Millisecond
-	notificationDelay        = 200 * time.Millisecond // Initial notification limit for new feeds
-	initialNotificationLimit = 5
-	maxSeenLinks             = 500
-	translationTimeout       = 10 * time.Second
+	userAgent                    = "RSS-Filter-Bot/1.0"
+	defaultTimeout               = 10 * time.Second
+	anthropicMaxTokens           = 1024
+	mastodonMaxStatusLength      = 500
+	delayedStartIndex            = 1
+	domainDelay                  = 500 * time.Millisecond
+	notificationDelay            = 200 * time.Millisecond // Initial notification limit for new feeds
+	initialNotificationLimit     = 5
+	maxSeenLinks                 = 500
+	translationTimeout           = 10 * time.Second
+	translationRetryCount        = 2
+	translationInitialRetryDelay = 3 * time.Second
 
 	// 1: FeedTitle, 2: Title, 3: Link, 4: Description, 5: PreviousTitle, 6: PreviousLink
 	slackFormatDelayed = `*<%[6]s|[%[1]s] %[5]s>*
@@ -198,21 +199,24 @@ type AnthropicTranslator struct {
 }
 
 func (t *AnthropicTranslator) Translate(ctx context.Context, prompt string) (string, error) {
-	message, err := t.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.Model(t.model),
-		MaxTokens: int64(anthropicMaxTokens),
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
-		},
-	})
-	if err != nil {
-		return "", err
-	}
+	return executeWithRetry(ctx, func() (string, error) {
+		message, err := t.client.Messages.New(ctx, anthropic.MessageNewParams{
+			Model:     anthropic.Model(t.model),
+			MaxTokens: int64(anthropicMaxTokens),
+			Messages: []anthropic.MessageParam{
+				anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+			},
+		})
 
-	if len(message.Content) > 0 {
-		return message.Content[0].Text, nil
-	}
-	return "", fmt.Errorf("no content in response")
+		if err != nil {
+			return "", err
+		}
+
+		if len(message.Content) > 0 {
+			return message.Content[0].Text, nil
+		}
+		return "", fmt.Errorf("no content in response")
+	})
 }
 
 func main() {
@@ -612,7 +616,7 @@ func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, not
 
 	// 2. Prepend new links to existing SeenLinks (so index 0 is always newest)
 	//    Handling potential duplicates if logic wasn't perfect?
-	//    We can just prepend. The dedupe logic in reading prevents adding same things again mostly.
+	//    // We can just prepend. The dedupe logic in reading prevents adding same things again mostly.
 	combined := append(newLinks, currentState.SeenLinks...)
 
 	// 3. Truncate to maxSeenLinks
@@ -766,4 +770,38 @@ func translateNotificationItems(ctx context.Context, translator Translator, item
 		translatedItems = append(translatedItems, item)
 	}
 	return translatedItems
+}
+
+func executeWithRetry(ctx context.Context, op func() (string, error)) (string, error) {
+	var lastErr error
+	delay := translationInitialRetryDelay
+
+	for i := 0; i <= translationRetryCount; i++ {
+		res, err := op()
+		if err == nil {
+			return res, nil
+		}
+
+		lastErr = err
+
+		if !isRateLimitError(err) {
+			return "", err
+		}
+
+		if i < translationRetryCount {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(delay):
+				delay *= 2
+			}
+		}
+	}
+
+	return "", lastErr
+}
+
+func isRateLimitError(err error) bool {
+	var apiErr *anthropic.Error
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests
 }
