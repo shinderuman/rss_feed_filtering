@@ -131,6 +131,8 @@ type FeedResult struct {
 	State FeedState
 }
 
+type SaveStateFunc func(*State) error
+
 func (n NotificationItem) Format(forSlack bool) string {
 	d := mastodonFormatDelayed
 	nm := mastodonFormatNormal
@@ -235,13 +237,11 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("State load error: %w", err)
 	}
 
-	updatedState, processErr := processFeeds(ctx, appConfig, state)
+	processErr := processFeeds(ctx, appConfig, state, func(s *State) error {
+		return saveState(ctx, s3Client, s)
+	})
 	if processErr != nil {
 		slog.Error("Some feeds failed", "error", processErr)
-	}
-
-	if err := saveState(ctx, s3Client, updatedState); err != nil {
-		return fmt.Errorf("State save error: %w", err)
 	}
 
 	return processErr
@@ -298,7 +298,7 @@ func loadState(ctx context.Context, client *s3.Client) (*State, error) {
 	return &state, nil
 }
 
-func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*State, error) {
+func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveStateFunc SaveStateFunc) error {
 	newState := &State{Feeds: make(map[string]FeedState)}
 	maps.Copy(newState.Feeds, oldState.Feeds)
 
@@ -318,9 +318,12 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State) (*Sta
 
 	for res := range resultCh {
 		newState.Feeds[res.Key] = res.State
+		if err := saveStateFunc(newState); err != nil {
+			slog.Error("Failed to save state incrementally", "error", err)
+		}
 	}
 
-	return newState, nil
+	return nil
 }
 
 func processFeedConfig(ctx context.Context, cfg FeedFilterConfig, appConfig *Config, oldState *State, out chan<- FeedResult, wg *sync.WaitGroup) {
@@ -435,9 +438,7 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 		notifyItems = translateNotificationItems(ctx, translator, notifyItems)
 	}
 
-	if err := sendNotificationItems(ctx, notifyItems); err != nil {
-		return &nextState, statusCode, err
-	}
+	sendNotificationItems(ctx, notifyItems)
 	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, delayedDomains)
 
 	return &nextState, statusCode, nil
@@ -546,7 +547,7 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 	return notifyItems
 }
 
-func sendNotificationItems(ctx context.Context, items []NotificationItem) error {
+func sendNotificationItems(ctx context.Context, items []NotificationItem) {
 	var errs []string
 	for _, item := range items {
 		if err := sendNotifications(ctx, item); err != nil {
@@ -556,9 +557,8 @@ func sendNotificationItems(ctx context.Context, items []NotificationItem) error 
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("%s", strings.Join(errs, ", "))
+		slog.Error("Some notifications failed", "errors", strings.Join(errs, ", "))
 	}
-	return nil
 }
 
 func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, notifyItems []NotificationItem, feed *gofeed.Feed, url string, delayedDomains []string) {

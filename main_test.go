@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -186,16 +187,32 @@ func TestProcessFeeds(t *testing.T) {
 		Feeds: map[string]FeedState{},
 	}
 
+	// Capture state
+	var capturedState *State
+	var mu sync.Mutex
+	saveFunc := func(s *State) error {
+		mu.Lock()
+		defer mu.Unlock()
+		capturedState = s
+		return nil
+	}
+
 	start := time.Now()
-	newState, err := processFeeds(ctx, appConfig, oldState)
+	err := processFeeds(ctx, appConfig, oldState, saveFunc)
 	elapsed := time.Since(start)
 
 	if err != nil {
 		t.Fatalf("processFeeds failed: %v", err)
 	}
 
-	if len(newState.Feeds) != 2 {
-		t.Errorf("Expected 2 feed states, got %d", len(newState.Feeds))
+	mu.Lock()
+	defer mu.Unlock()
+	if capturedState == nil {
+		t.Fatal("saveStateFunc was never called")
+	}
+
+	if len(capturedState.Feeds) != 2 {
+		t.Errorf("Expected 2 feed states, got %d", len(capturedState.Feeds))
 	}
 
 	// If sequential: (200ms server + 200ms notification) * 2 = 800ms
@@ -243,16 +260,32 @@ func TestProcessFeeds_InnerParallelism(t *testing.T) {
 		Feeds: make(map[string]FeedState),
 	}
 
+	// Capture state
+	var capturedState *State
+	var mu sync.Mutex
+	saveFunc := func(s *State) error {
+		mu.Lock()
+		defer mu.Unlock()
+		capturedState = s
+		return nil
+	}
+
 	start := time.Now()
-	newState, err := processFeeds(ctx, appConfig, oldState)
+	err := processFeeds(ctx, appConfig, oldState, saveFunc)
 	elapsed := time.Since(start)
 
 	if err != nil {
 		t.Fatalf("processFeeds failed: %v", err)
 	}
 
-	if len(newState.Feeds) != 2 {
-		t.Errorf("Expected 2 feed states, got %d", len(newState.Feeds))
+	mu.Lock()
+	defer mu.Unlock()
+	if capturedState == nil {
+		t.Fatal("saveStateFunc was never called")
+	}
+
+	if len(capturedState.Feeds) != 2 {
+		t.Errorf("Expected 2 feed states, got %d", len(capturedState.Feeds))
 	}
 
 	// Verify time
@@ -328,9 +361,29 @@ func TestProcessFeeds_ParallelStateUpdate(t *testing.T) {
 	}
 
 	// 3. Run
-	newState, _ := processFeeds(ctx, appConfig, oldState)
+	var capturedState *State
+	var mu sync.Mutex
+	saveFunc := func(s *State) error {
+		mu.Lock()
+		defer mu.Unlock()
+		capturedState = s
+		return nil
+	}
+
+	// 3. Run
+	err := processFeeds(ctx, appConfig, oldState, saveFunc)
+	if err != nil {
+		t.Fatalf("processFeeds failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if capturedState == nil {
+		t.Fatal("saveStateFunc was never called")
+	}
 
 	// 4. Verify
+	newState := capturedState
 
 	// Check TS1 (Updated)
 	if state, ok := newState.Feeds[key1]; !ok {
