@@ -45,6 +45,7 @@ const (
 	notificationDelay        = 200 * time.Millisecond // Initial notification limit for new feeds
 	initialNotificationLimit = 5
 	maxSeenLinks             = 100
+	translationTimeout       = 10 * time.Second
 
 	// 1: FeedTitle, 2: Title, 3: Link, 4: Description, 5: PreviousTitle, 6: PreviousLink
 	slackFormatDelayed = `*<%[6]s|[%[1]s] %[5]s>*
@@ -424,6 +425,8 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 		client := anthropic.NewClient(
 			option.WithAPIKey(anthropicAuthToken),
 			option.WithBaseURL(anthropicBaseURL),
+			option.WithHTTPClient(&http.Client{Timeout: translationTimeout}),
+			option.WithMaxRetries(0),
 		)
 		translator := &AnthropicTranslator{
 			client: &client,

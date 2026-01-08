@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/mmcdole/gofeed"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
 // MockTranslator for testing
@@ -386,4 +389,47 @@ func TestGetNotificationItems_WithMastodonToken(t *testing.T) {
 	if items[0].MastodonAccessToken != "custom_token" {
 		t.Errorf("Expected token 'custom_token', got '%s'", items[0].MastodonAccessToken)
 	}
+}
+
+func TestAnthropicTranslator_Translate_TimeoutActual(t *testing.T) {
+	// 1. Mock server that sleeps longer than 10s (timeout)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(translationTimeout + 2*time.Second)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"type":"message","id":"msg_123","role":"assistant","content":[{"type":"text","text":"Translated"}]}`))
+	}))
+	defer ts.Close()
+
+	// 2. Client configuration
+	client := anthropic.NewClient(
+		option.WithAPIKey("dummy"),
+		option.WithBaseURL(ts.URL),
+		option.WithHTTPClient(&http.Client{Timeout: translationTimeout}),
+		option.WithMaxRetries(0),
+	)
+
+	translator := &AnthropicTranslator{
+		client: &client,
+		model:  "claude-dummy",
+	}
+
+	// 3. Execution
+	start := time.Now()
+	// context.Background() passed here, so reliance is on Translate's internal context.WithTimeout (if present)
+	// OR http.Client timeout if context.WithTimeout was reverted.
+	// Since user reverted context.WithTimeout, this verifies http.Client timeout works locally.
+	_, err := translator.Translate(context.Background(), "test")
+	duration := time.Since(start)
+
+	// 4. Verification
+	if err == nil {
+		t.Fatal("Expected timeout error, got nil")
+	}
+
+	// Should be slightly over 10s
+	if duration > translationTimeout+1*time.Second {
+		t.Errorf("Test took too long: %v. Expected around %v", duration, translationTimeout)
+	}
+
+	t.Logf("Timeout confirmed. Duration: %v, Error: %v", duration, err)
 }
