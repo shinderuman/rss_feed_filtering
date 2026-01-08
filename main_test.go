@@ -451,6 +451,116 @@ func TestProcessFeeds_ParallelStateUpdate(t *testing.T) {
 	}
 }
 
+func TestProcessFeeds_IncrementalSaveVerification(t *testing.T) {
+	// Setup: 2 successful feeds
+	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<rss version="2.0"><channel><item><title>Item1</title><link>http://example.com/1</link></item></channel></rss>`)
+	}))
+	defer ts1.Close()
+
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<rss version="2.0"><channel><item><title>Item2</title><link>http://example.com/2</link></item></channel></rss>`)
+	}))
+	defer ts2.Close()
+
+	ctx := context.Background()
+	appConfig := &Config{
+		Configs: []FeedFilterConfig{
+			{URLs: []string{ts1.URL}},
+			{URLs: []string{ts2.URL}},
+		},
+	}
+
+	oldState := &State{Feeds: make(map[string]FeedState)}
+
+	// Capture save calls
+	var saveCallCount int
+	var mu sync.Mutex
+
+	saveFunc := func(s *State) error {
+		mu.Lock()
+		defer mu.Unlock()
+		saveCallCount++
+		// Verify that the state passed here is valid and not empty
+		if len(s.Feeds) == 0 {
+			return fmt.Errorf("saved empty state")
+		}
+		return nil
+	}
+
+	err := processFeeds(ctx, appConfig, oldState, saveFunc)
+	if err != nil {
+		t.Fatalf("processFeeds failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Since we have 2 feeds processing successfully, saveFunc should be called at least 2 times.
+	if saveCallCount < 2 {
+		t.Errorf("Expected at least 2 save calls for 2 feeds, got %d", saveCallCount)
+	}
+}
+
+func TestProcessFeeds_Idempotency(t *testing.T) {
+	// Setup: Feed with 1 item
+	rssContent := `<rss version="2.0"><channel><item><title>Item1</title><link>http://example.com/1</link></item></channel></rss>`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, rssContent)
+	}))
+	defer ts.Close()
+
+	ctx := context.Background()
+	appConfig := &Config{Configs: []FeedFilterConfig{{URLs: []string{ts.URL}}}}
+
+	// Run 1: Initial State (Empty)
+	state1 := &State{Feeds: make(map[string]FeedState)}
+	var savedState *State
+	saveFunc := func(s *State) error {
+		savedState = s
+		return nil
+	}
+
+	if err := processFeeds(ctx, appConfig, state1, saveFunc); err != nil {
+		t.Fatalf("Run 1 failed: %v", err)
+	}
+
+	// Verify Run 1 State
+	key := fmt.Sprintf("%x", md5.Sum([]byte(ts.URL)))
+	if len(savedState.Feeds[key].SeenLinks) != 1 {
+		t.Fatalf("Run 1: Expected 1 seen link, got %d", len(savedState.Feeds[key].SeenLinks))
+	}
+
+	// Run 2: Re-run with Saved State
+	// The feed content is exactly the same. Should produce NO notifications and maintain state.
+	// (Note: In real app, we track LastLink/SeenLinks. processSingleFeed should see link is in SeenLinks and produce 0 notifyItems)
+
+	// We need to capture if any notifications were sent.
+	// Since processFeeds calls processSingleFeed which calls sendNotificationItems (which logs),
+	// we can't easily capture output here without refactoring sendNotificationItems injection.
+	// BUT, we can check the State. If 0 items were found, LastLink/SeenLinks shouldn't change (or just be re-asserted).
+
+	state2 := savedState
+	var savedState2 *State
+	saveFunc2 := func(s *State) error {
+		savedState2 = s
+		return nil
+	}
+
+	if err := processFeeds(ctx, appConfig, state2, saveFunc2); err != nil {
+		t.Fatalf("Run 2 failed: %v", err)
+	}
+
+	// If processFeeds found 0 new items to notify, it still runs and might save state (e.g. LastModified might update if server doesn't support 304).
+	// But SeenLinks should NOT grow.
+	if len(savedState2.Feeds[key].SeenLinks) != 1 {
+		t.Errorf("Run 2: Expected SeenLinks length to remain 1, got %d", len(savedState2.Feeds[key].SeenLinks))
+	}
+	if savedState2.Feeds[key].SeenLinks[0] != "http://example.com/1" {
+		t.Errorf("Run 2: SeenLinks corrupted")
+	}
+}
+
 func TestGetNotificationItems_WithMastodonToken(t *testing.T) {
 	feed := &gofeed.Feed{
 		Items: []*gofeed.Item{
