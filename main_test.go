@@ -584,10 +584,21 @@ func TestGetNotificationItems_WithMastodonToken(t *testing.T) {
 	}
 }
 
-func TestAnthropicTranslator_Translate_TimeoutActual(t *testing.T) {
-	// 1. Mock server that sleeps longer than 10s (timeout)
+func TestAnthropicTranslator_Translate_Timeout_Retry(t *testing.T) {
+	// 1. Mock server that sleeps longer than 10s (timeout) for first 2 attempts, then succeeds
+	var attempts int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(translationTimeout + 2*time.Second)
+		attempts++
+		if attempts <= 2 {
+			// Simulate timeout
+			time.Sleep(translationTimeout + 2*time.Second)
+			// Even if we write response, client should have timed out
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Success on 3rd attempt
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"type":"message","id":"msg_123","role":"assistant","content":[{"type":"text","text":"Translated"}]}`))
 	}))
@@ -608,23 +619,36 @@ func TestAnthropicTranslator_Translate_TimeoutActual(t *testing.T) {
 
 	// 3. Execution
 	start := time.Now()
-	// context.Background() passed here, so reliance is on Translate's internal context.WithTimeout (if present)
-	// OR http.Client timeout if context.WithTimeout was reverted.
-	// Since user reverted context.WithTimeout, this verifies http.Client timeout works locally.
-	_, err := translator.Translate(context.Background(), "test")
+	res, err := translator.Translate(context.Background(), "test")
 	duration := time.Since(start)
 
 	// 4. Verification
-	if err == nil {
-		t.Fatal("Expected timeout error, got nil")
+	if err != nil {
+		t.Fatalf("Expected success after retries, got error: %v", err)
 	}
 
-	// Should be slightly over 10s
-	if duration > translationTimeout+1*time.Second {
-		t.Errorf("Test took too long: %v. Expected around %v", duration, translationTimeout)
+	if res != "Translated" {
+		t.Errorf("Expected 'Translated', got '%s'", res)
 	}
 
-	t.Logf("Timeout confirmed. Duration: %v, Error: %v", duration, err)
+	// Expected Timing:
+	// Attempt 1 (0s): Timeout (10s) -> Sleep 3s
+	// Attempt 2 (13s): Timeout (10s) -> Sleep 6s
+	// Attempt 3 (29s): Success (immediate)
+	// Total minimum time: 29s
+	// However, if the http.Client timeout fires at 10s, the "Wait" in executeWithRetry happens AFTER the error return.
+	// So:
+	// 1. Call -> 10s -> Timeout Err -> Sleep 3s
+	// 2. Call -> 10s -> Timeout Err -> Sleep 6s
+	// 3. Call -> Success
+	// Total: 10 + 3 + 10 + 6 = 29s approximately.
+
+	expectedMin := 20 * time.Second // Conservative lower bound
+	if duration < expectedMin {
+		t.Errorf("Test took too short: %v. Expected > %v", duration, expectedMin)
+	}
+
+	t.Logf("Retry success confirmed. Duration: %v, Attempts: %d", duration, attempts)
 }
 
 func TestAnthropicTranslator_Translate_Retry429(t *testing.T) {

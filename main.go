@@ -784,7 +784,7 @@ func executeWithRetry(ctx context.Context, op func() (string, error)) (string, e
 
 		lastErr = err
 
-		if !isRateLimitError(err) {
+		if !shouldRetry(err) {
 			return "", err
 		}
 
@@ -801,7 +801,21 @@ func executeWithRetry(ctx context.Context, op func() (string, error)) (string, e
 	return "", lastErr
 }
 
-func isRateLimitError(err error) bool {
+func shouldRetry(err error) bool {
 	var apiErr *anthropic.Error
-	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+
+	var netErr interface{ Timeout() bool }
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	errMsg := strings.ToLower(err.Error())
+	return strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "deadline exceeded")
 }
