@@ -341,9 +341,11 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveS
 
 	for res := range resultCh {
 		newState.Feeds[res.Key] = res.State
-		if err := saveStateFunc(newState); err != nil {
-			slog.Error("Failed to save state incrementally", "error", err)
-		}
+	}
+
+	if err := saveStateFunc(newState); err != nil {
+		slog.Error("Failed to save state", "error", err)
+		return err
 	}
 
 	return nil

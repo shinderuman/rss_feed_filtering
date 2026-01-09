@@ -451,7 +451,7 @@ func TestProcessFeeds_ParallelStateUpdate(t *testing.T) {
 	}
 }
 
-func TestProcessFeeds_IncrementalSaveVerification(t *testing.T) {
+func TestProcessFeeds_SaveOnce(t *testing.T) {
 	// Setup: 2 successful feeds
 	ts1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<rss version="2.0"><channel><item><title>Item1</title><link>http://example.com/1</link></item></channel></rss>`)
@@ -496,9 +496,9 @@ func TestProcessFeeds_IncrementalSaveVerification(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Since we have 2 feeds processing successfully, saveFunc should be called at least 2 times.
-	if saveCallCount < 2 {
-		t.Errorf("Expected at least 2 save calls for 2 feeds, got %d", saveCallCount)
+	// saveFunc should be called exactly once
+	if saveCallCount != 1 {
+		t.Errorf("Expected exactly 1 save call, got %d", saveCallCount)
 	}
 }
 
