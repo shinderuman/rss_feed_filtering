@@ -43,7 +43,7 @@ const (
 	domainDelay                  = 500 * time.Millisecond
 	notificationDelay            = 200 * time.Millisecond // Initial notification limit for new feeds
 	initialNotificationLimit     = 5
-	maxSeenLinks                 = 250
+	rssHistoryMultiplier         = 2.0
 	translationTimeout           = 10 * time.Second
 	translationRetryCount        = 5
 	translationInitialRetryDelay = 3 * time.Second
@@ -106,6 +106,7 @@ var (
 	anthropicBaseURL      string
 	anthropicDefaultModel string
 	urlRegex              = regexp.MustCompile(`https?://[^\s]+`)
+	senderFunc            = sendNotificationItems
 )
 
 type Config struct {
@@ -498,8 +499,8 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 		notifyItems = translateNotificationItems(ctx, translator, notifyItems)
 	}
 
-	sendNotificationItems(ctx, notifyItems)
-	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, delayedDomains)
+	senderFunc(ctx, notifyItems)
+	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, delayedDomains, len(feed.Items))
 
 	return &nextState, statusCode, nil
 }
@@ -626,41 +627,46 @@ func sendNotificationItems(ctx context.Context, items []NotificationItem) {
 	}
 }
 
-func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, notifyItems []NotificationItem, feed *gofeed.Feed, url string, delayedDomains []string) {
-	// Update LastLink for backward compatibility or reference
+func updateStateWithLatestItem(nextState *FeedState, currentState FeedState, notifyItems []NotificationItem, feed *gofeed.Feed, url string, delayedDomains []string, currentFeedCount int) {
+	nextState.LastLink = determineLastLink(currentState, notifyItems, feed, url, delayedDomains)
+	nextState.SeenLinks = updateSeenLinks(currentState.SeenLinks, notifyItems, currentFeedCount)
+}
+
+func determineLastLink(currentState FeedState, notifyItems []NotificationItem, feed *gofeed.Feed, url string, delayedDomains []string) string {
 	if len(notifyItems) > 0 {
-		mostRecent := notifyItems[0]
-		nextState.LastLink = mostRecent.Link
-	} else if currentState.LastLink == "" && len(feed.Items) > 0 {
+		return notifyItems[0].Link
+	}
+
+	if currentState.LastLink == "" && len(feed.Items) > 0 {
 		idx := 0
 		if isDelayedDomain(url, delayedDomains) {
 			idx = delayedStartIndex
 		}
 		if idx < len(feed.Items) {
-			nextState.LastLink = feed.Items[idx].Link
+			return feed.Items[idx].Link
 		}
 	}
 
-	// Update SeenLinks
-	// 1. Gather new links from notifyItems (descending order in slice = Newest to Oldest)
-	//    Wait, feed.Items are Newest-First. loop runs 0..N.
-	//    notifyItems are appended in order of appearance (Newest -> Oldest).
-	//    So notifyItems[0] is the Newest.
+	return currentState.LastLink
+}
+
+func updateSeenLinks(currentSeenLinks []string, notifyItems []NotificationItem, currentFeedCount int) []string {
 	var newLinks []string
 	for _, item := range notifyItems {
 		newLinks = append(newLinks, item.Link)
 	}
 
-	// 2. Prepend new links to existing SeenLinks (so index 0 is always newest)
-	//    Handling potential duplicates if logic wasn't perfect?
-	//    // We can just prepend. The dedupe logic in reading prevents adding same things again mostly.
-	combined := append(newLinks, currentState.SeenLinks...)
+	combined := append(newLinks, currentSeenLinks...)
 
-	// 3. Truncate to maxSeenLinks
-	if len(combined) > maxSeenLinks {
-		combined = combined[:maxSeenLinks]
+	if currentFeedCount > 0 {
+		limit := max(int(float64(currentFeedCount)*rssHistoryMultiplier), currentFeedCount)
+
+		if len(combined) > limit {
+			combined = combined[:limit]
+		}
 	}
-	nextState.SeenLinks = combined
+
+	return combined
 }
 
 func passesFilters(item *gofeed.Item, include []string, exclude []string) bool {

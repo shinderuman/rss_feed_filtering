@@ -46,8 +46,8 @@ func TestUpdateStateWithLatestItem(t *testing.T) {
 	// It's a const in main.go, hard to mock directly without changing code structure.
 	// But we can test basic appending.
 	// We can trust the const is 100. If we want to test truncation, we need 101 items.
-
-	updateStateWithLatestItem(nextState, current, notifyItems, feed, "", nil)
+	// Update: Function now takes feed count for dynamic limit. We pass 100 so limit is 200, no truncation for this test.
+	updateStateWithLatestItem(nextState, current, notifyItems, feed, "", nil, 100)
 
 	expected := []string{"new1", "new2", "old1", "old2"}
 	if !reflect.DeepEqual(nextState.SeenLinks, expected) {
@@ -810,4 +810,97 @@ func TestProcessFeeds_TimeoutSave(t *testing.T) {
 	}
 
 	t.Logf("Elapsed: %v", elapsed)
+}
+func TestUpdateStateWithLatestItem_Multiplier(t *testing.T) {
+	// rssHistoryMultiplier is 2.0 (const in main.go)
+
+	// Case 1: Small Feed (Feed Count 30 -> Limit 60)
+	// We simulate existing seen links (40 items) + new items (30 items) = 70 items total.
+	// Expected: Truncated to 60.
+
+	current1 := FeedState{SeenLinks: make([]string, 40)}
+	for i := 0; i < 40; i++ {
+		current1.SeenLinks[i] = fmt.Sprintf("old%d", i)
+	}
+
+	notifyItems1 := make([]NotificationItem, 30)
+	for i := 0; i < 30; i++ {
+		notifyItems1[i] = NotificationItem{Link: fmt.Sprintf("new%d", i)}
+	}
+
+	next1 := &FeedState{}
+	updateStateWithLatestItem(next1, current1, notifyItems1, &gofeed.Feed{}, "", nil, 30) // Feed Count 30
+
+	expectedLimit1 := 60
+	if len(next1.SeenLinks) != expectedLimit1 {
+		t.Errorf("Case 1: Expected limit %d, got %d", expectedLimit1, len(next1.SeenLinks))
+	}
+
+	// Case 2: Large Feed (Feed Count 200 -> Limit 400)
+	// We simulate existing (200) + new (250) = 450 items.
+	// Expected: Truncated to 400.
+
+	current2 := FeedState{SeenLinks: make([]string, 200)}
+	for i := 0; i < 200; i++ {
+		current2.SeenLinks[i] = fmt.Sprintf("old%d", i)
+	}
+
+	notifyItems2 := make([]NotificationItem, 250)
+	for i := 0; i < 250; i++ {
+		notifyItems2[i] = NotificationItem{Link: fmt.Sprintf("new%d", i)}
+	}
+
+	next2 := &FeedState{}
+	updateStateWithLatestItem(next2, current2, notifyItems2, &gofeed.Feed{}, "", nil, 200) // Feed Count 200
+
+	expectedLimit2 := 400
+	if len(next2.SeenLinks) != expectedLimit2 {
+		t.Errorf("Case 2: Expected limit %d, got %d", expectedLimit2, len(next2.SeenLinks))
+	}
+
+	// Case 3: Empty Feed / Error (Feed Count 0 -> No Truncation)
+	// Even if we have tons of items, if feed count reports 0 (e.g. failed fetch but somehow updated?),
+	// specific logic prevents truncation.
+
+	current3 := FeedState{SeenLinks: make([]string, 500)} // Huge existing
+	for i := 0; i < 500; i++ {
+		current3.SeenLinks[i] = "item"
+	}
+
+	next3 := &FeedState{}
+	updateStateWithLatestItem(next3, current3, []NotificationItem{}, &gofeed.Feed{}, "", nil, 0) // Feed Count 0
+
+	if len(next3.SeenLinks) != 500 {
+		t.Errorf("Case 3: Expected no truncation (500), got %d", len(next3.SeenLinks))
+	}
+}
+
+func TestProcessSingleFeed_NotificationCount(t *testing.T) {
+	// Mock senderFunc
+	callCount := 0
+	originalSender := senderFunc
+	senderFunc = func(ctx context.Context, items []NotificationItem) {
+		callCount++
+	}
+	defer func() { senderFunc = originalSender }()
+
+	// Start Mock Server to return this feed
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		feedStr := `<rss version="2.0"><channel><item><title>New Item</title><link>new</link></item></channel></rss>`
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, feedStr)
+	}))
+	defer ts.Close()
+
+	ctx := context.Background()
+	cfg := FeedFilterConfig{}
+	state := FeedState{SeenLinks: []string{}}
+
+	// Exec
+	processSingleFeed(ctx, ts.URL, cfg, nil, nil, state)
+
+	// Verify
+	if callCount != 1 {
+		t.Errorf("Expected notification sender to be called exactly once, got %d", callCount)
+	}
 }
