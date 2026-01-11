@@ -43,7 +43,7 @@ const (
 	domainDelay                  = 500 * time.Millisecond
 	notificationDelay            = 200 * time.Millisecond // Initial notification limit for new feeds
 	initialNotificationLimit     = 5
-	maxSeenLinks                 = 1000
+	maxSeenLinks                 = 250
 	translationTimeout           = 10 * time.Second
 	translationRetryCount        = 5
 	translationInitialRetryDelay = 3 * time.Second
