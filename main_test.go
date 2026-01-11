@@ -758,3 +758,56 @@ func TestAnthropicTranslator_Translate_Retry502(t *testing.T) {
 		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
 	}
 }
+
+func TestProcessFeeds_TimeoutSave(t *testing.T) {
+	// Setup: Mock server that simulates a slow feed
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond) // Simulating work longer than timeout buffer interaction
+		fmt.Fprint(w, `<rss version="2.0"><channel><item><title>Item1</title><link>http://example.com/1</link></item></channel></rss>`)
+	}))
+	defer ts.Close()
+
+	appConfig := &Config{
+		Configs: []FeedFilterConfig{
+			{URLs: []string{ts.URL}},
+		},
+	}
+	oldState := &State{Feeds: make(map[string]FeedState)}
+
+	// Verify save is called
+	var saveCallCount int
+	var mu sync.Mutex
+	saveFunc := func(s *State) error {
+		mu.Lock()
+		defer mu.Unlock()
+		saveCallCount++
+		return nil
+	}
+
+	// Create a context with a deadline that triggers graceful shutdown.
+	// We set deadline to Now() + gracefulShutdownBuffer + 100ms.
+	// The shutdownTimer uses (deadline - gracefulShutdownBuffer), so it will fire in 100ms.
+	// The feed takes 500ms, so it should be interrupted by the shutdown logic.
+	ctx, cancel := context.WithTimeout(context.Background(), gracefulShutdownBuffer+100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := processFeeds(ctx, appConfig, oldState, saveFunc)
+	elapsed := time.Since(start)
+
+	// We expect an error "graceful shutdown due to timeout"
+	if err == nil {
+		t.Fatal("Expected timeout error, got nil")
+	}
+	if err.Error() != "graceful shutdown due to timeout" {
+		t.Errorf("Expected 'graceful shutdown due to timeout', got '%v'", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if saveCallCount == 0 {
+		t.Error("Expected saveFunc to be called on timeout")
+	}
+
+	t.Logf("Elapsed: %v", elapsed)
+}

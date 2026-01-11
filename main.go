@@ -47,6 +47,7 @@ const (
 	translationTimeout           = 10 * time.Second
 	translationRetryCount        = 5
 	translationInitialRetryDelay = 3 * time.Second
+	gracefulShutdownBuffer       = 2 * time.Second
 
 	// 1: FeedTitle, 2: Title, 3: Link, 4: Description, 5: PreviousTitle, 6: PreviousLink
 	slackFormatDelayed = `*<%[6]s|[%[1]s] %[5]s>*
@@ -339,8 +340,8 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveS
 		close(resultCh)
 	}()
 
-	for res := range resultCh {
-		newState.Feeds[res.Key] = res.State
+	if err := collectResults(ctx, resultCh, newState, saveStateFunc); err != nil {
+		return err
 	}
 
 	if err := saveStateFunc(newState); err != nil {
@@ -369,6 +370,40 @@ func processFeedConfig(ctx context.Context, cfg FeedFilterConfig, appConfig *Con
 		go processDomainUrls(ctx, urls, cfg, appConfig, oldState, excludeWords, out, &innerWg)
 	}
 	innerWg.Wait()
+}
+
+func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *State, saveStateFunc SaveStateFunc) error {
+	var shutdownCh <-chan time.Time
+	if deadline, ok := ctx.Deadline(); ok {
+		shutdownTimer := time.NewTimer(time.Until(deadline) - gracefulShutdownBuffer)
+		shutdownCh = shutdownTimer.C
+		defer shutdownTimer.Stop()
+	}
+
+	for {
+		select {
+		case res, ok := <-resultCh:
+			if !ok {
+				return nil
+			}
+			newState.Feeds[res.Key] = res.State
+
+		case <-shutdownCh:
+			slog.Warn("Approaching Lambda timeout, saving state and performing graceful shutdown")
+			if err := saveStateFunc(newState); err != nil {
+				slog.Error("Failed to save state during graceful shutdown", "error", err)
+				return err
+			}
+			return fmt.Errorf("graceful shutdown due to timeout")
+
+		case <-ctx.Done():
+			slog.Warn("Context done, saving state", "error", ctx.Err())
+			if err := saveStateFunc(newState); err != nil {
+				slog.Error("Failed to save state on context done", "error", err)
+			}
+			return ctx.Err()
+		}
+	}
 }
 
 func processDomainUrls(ctx context.Context, urls []string, cfg FeedFilterConfig, appConfig *Config, oldState *State, excludeWords []string, out chan<- FeedResult, wg *sync.WaitGroup) {
