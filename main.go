@@ -113,6 +113,8 @@ type Config struct {
 	GlobalExcludeWords []string           `json:"global_exclude_keywords"`
 	DelayedDomains     []string           `json:"delayed_domains"`
 	Configs            []FeedFilterConfig `json:"configs"`
+	EnableSlack        bool               `json:"enable_slack"`
+	EnableMastodon     bool               `json:"enable_mastodon"`
 }
 
 type FeedFilterConfig struct {
@@ -142,6 +144,7 @@ type NotificationItem struct {
 	Description         string
 	FeedTitle           string
 	SlackChannelID      string
+	EnableSlack         bool
 	EnableMastodon      bool
 	MastodonAccessToken string
 	PreviousTitle       string
@@ -418,7 +421,7 @@ func processDomainUrls(ctx context.Context, urls []string, cfg FeedFilterConfig,
 		feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
 		currentState := oldState.Feeds[feedKey]
 
-		updatedFeedState, statusCode, err := processSingleFeed(ctx, url, cfg, excludeWords, appConfig.DelayedDomains, currentState)
+		updatedFeedState, statusCode, err := processSingleFeed(ctx, url, cfg, excludeWords, appConfig, currentState)
 
 		if err != nil {
 			errorType := "fetch_error"
@@ -458,7 +461,7 @@ func getHostname(urlStr string) string {
 	return u.Hostname()
 }
 
-func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, delayedDomains []string, currentState FeedState) (*FeedState, int, error) {
+func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, appConfig *Config, currentState FeedState) (*FeedState, int, error) {
 
 	feed, respHeaders, statusCode, err := fetchAndParse(url, currentState.LastModified, currentState.ETag)
 	if err != nil {
@@ -478,7 +481,7 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 		currentState.SeenLinks = []string{currentState.LastLink}
 	}
 
-	notifyItems := getNotificationItems(feed, feedCfg, currentState.SeenLinks, excludeWords, delayedDomains, url)
+	notifyItems := getNotificationItems(feed, feedCfg, currentState.SeenLinks, excludeWords, appConfig, url)
 
 	if currentState.LastLink == "" && len(notifyItems) > initialNotificationLimit {
 		slog.Info("limiting notifications for new feed", "url", url, "count", len(notifyItems), "limit", initialNotificationLimit)
@@ -500,7 +503,7 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	}
 
 	senderFunc(ctx, notifyItems)
-	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, delayedDomains, len(feed.Items))
+	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, appConfig.DelayedDomains, len(feed.Items))
 
 	return &nextState, statusCode, nil
 }
@@ -561,7 +564,7 @@ func fetchFeedContent(feedURL string, headers map[string]string) ([]byte, http.H
 	return body, resp.Header, resp.StatusCode, err
 }
 
-func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks []string, exclude []string, delayedDomains []string, feedURL string) []NotificationItem {
+func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks []string, exclude []string, appConfig *Config, feedURL string) []NotificationItem {
 	var filteredCandidates []*gofeed.Item
 	for _, item := range feed.Items {
 		if passesFilters(item, feedCfg.IncludeKeywords, exclude) {
@@ -570,7 +573,7 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 	}
 
 	startIndex := 0
-	isDelayed := isDelayedDomain(feedURL, delayedDomains)
+	isDelayed := isDelayedDomain(feedURL, appConfig.DelayedDomains)
 	if isDelayed {
 		startIndex = delayedStartIndex
 	}
@@ -596,7 +599,8 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 			Description:         cleanDesc,
 			FeedTitle:           feed.Title,
 			SlackChannelID:      feedCfg.SlackChannelID,
-			EnableMastodon:      feedCfg.EnableMastodon,
+			EnableSlack:         appConfig.EnableSlack,
+			EnableMastodon:      appConfig.EnableMastodon && feedCfg.EnableMastodon,
 			MastodonAccessToken: feedCfg.MastodonAccessToken,
 		}
 
@@ -726,7 +730,7 @@ func sendNotifications(ctx context.Context, item NotificationItem) error {
 		)
 	}
 
-	if item.SlackChannelID != "" {
+	if item.EnableSlack && item.SlackChannelID != "" {
 		if err := postToSlack(item); err != nil {
 			logError("slack", err)
 			errs = append(errs, fmt.Sprintf("Slack: %v", err))

@@ -7,6 +7,8 @@
         "example.invalid",
         "sample-site.invalid"
     ],
+    "enable_slack": true,
+    "enable_mastodon": true,
     "configs": [
         {
             "include_keywords": ["tech"],

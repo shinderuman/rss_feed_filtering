@@ -72,7 +72,7 @@ func TestGetNotificationItems_SeenBreaks(t *testing.T) {
 	cfg := FeedFilterConfig{}
 	seenLinks := []string{"link3", "other"}
 
-	items := getNotificationItems(feed, cfg, seenLinks, nil, nil, "")
+	items := getNotificationItems(feed, cfg, seenLinks, nil, &Config{}, "")
 
 	if len(items) != 2 {
 		t.Errorf("Expected 2 items, got %d", len(items))
@@ -98,7 +98,7 @@ func TestGetNotificationItems_NoSeen(t *testing.T) {
 	cfg := FeedFilterConfig{}
 	seenLinks := []string{"link3"} // link3 is not in feed
 
-	items := getNotificationItems(feed, cfg, seenLinks, nil, nil, "")
+	items := getNotificationItems(feed, cfg, seenLinks, nil, &Config{}, "")
 
 	if len(items) != 2 {
 		t.Errorf("Expected 2 items, got %d", len(items))
@@ -117,7 +117,7 @@ func TestGetNotificationItems_EmptyFiltering(t *testing.T) {
 	cfg := FeedFilterConfig{}
 	seenLinks := []string{}
 
-	items := getNotificationItems(feed, cfg, seenLinks, nil, nil, "")
+	items := getNotificationItems(feed, cfg, seenLinks, nil, &Config{}, "")
 
 	if len(items) != 1 {
 		t.Errorf("Expected 1 item, got %d", len(items))
@@ -574,13 +574,55 @@ func TestGetNotificationItems_WithMastodonToken(t *testing.T) {
 	}
 	seenLinks := []string{}
 
-	items := getNotificationItems(feed, cfg, seenLinks, nil, nil, "")
+	items := getNotificationItems(feed, cfg, seenLinks, nil, &Config{EnableMastodon: true}, "")
 
 	if len(items) != 1 {
 		t.Errorf("Expected 1 item, got %d", len(items))
 	}
 	if items[0].MastodonAccessToken != "custom_token" {
 		t.Errorf("Expected token 'custom_token', got '%s'", items[0].MastodonAccessToken)
+	}
+}
+
+func TestGlobalFlags_Control(t *testing.T) {
+	feed := &gofeed.Feed{
+		Items: []*gofeed.Item{
+			{Title: "Item 1", Link: "link1"},
+		},
+	}
+	cfg := FeedFilterConfig{
+		EnableMastodon: true,
+		SlackChannelID: "C123",
+	}
+	seenLinks := []string{}
+
+	// Case 1: Global Flags False (Default)
+	appConfig := &Config{
+		EnableSlack:    false,
+		EnableMastodon: false,
+	}
+	items := getNotificationItems(feed, cfg, seenLinks, nil, appConfig, "")
+
+	if len(items) != 1 {
+		t.Errorf("Expected 1 item")
+	}
+	if items[0].EnableSlack {
+		t.Errorf("Expected EnableSlack to be false")
+	}
+	if items[0].EnableMastodon {
+		t.Errorf("Expected EnableMastodon to be false")
+	}
+
+	// Case 2: Global Flags True
+	appConfig.EnableSlack = true
+	appConfig.EnableMastodon = true
+	items = getNotificationItems(feed, cfg, seenLinks, nil, appConfig, "")
+
+	if !items[0].EnableSlack {
+		t.Errorf("Expected EnableSlack to be true")
+	}
+	if !items[0].EnableMastodon {
+		t.Errorf("Expected EnableMastodon to be true")
 	}
 }
 
@@ -897,7 +939,7 @@ func TestProcessSingleFeed_NotificationCount(t *testing.T) {
 	state := FeedState{SeenLinks: []string{}}
 
 	// Exec
-	processSingleFeed(ctx, ts.URL, cfg, nil, nil, state)
+	processSingleFeed(ctx, ts.URL, cfg, nil, &Config{}, state)
 
 	// Verify
 	if callCount != 1 {
