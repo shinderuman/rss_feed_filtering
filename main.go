@@ -618,12 +618,35 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 }
 
 func sendNotificationItems(ctx context.Context, items []NotificationItem) {
+	if len(items) == 0 {
+		return
+	}
+
 	var errs []string
+
+	// Mastodon: Send individually
 	for _, item := range items {
-		if err := sendNotifications(ctx, item); err != nil {
-			errs = append(errs, fmt.Sprintf("Notification failed for %s: %v", item.Title, err))
+		if err := postToMastodon(ctx, item); err != nil {
+			slog.Error("Notification failed",
+				"error_type", "notification_error",
+				"platform", "mastodon",
+				"item_title", item.Title,
+				"url", item.Link,
+				"error", err,
+			)
+			errs = append(errs, fmt.Sprintf("Mastodon: %v", err))
 		}
-		time.Sleep(notificationDelay)
+	}
+
+	// Slack: Send batched
+	if err := postToSlack(items); err != nil {
+		slog.Error("Notification failed",
+			"error_type", "notification_error",
+			"platform", "slack",
+			"count", len(items),
+			"error", err,
+		)
+		errs = append(errs, fmt.Sprintf("Slack: %v", err))
 	}
 
 	if len(errs) > 0 {
@@ -717,50 +740,38 @@ func cleanHTML(htmlContent string) string {
 	return urlRegex.ReplaceAllString(text, "")
 }
 
-func sendNotifications(ctx context.Context, item NotificationItem) error {
-	var errs []string
-
-	logError := func(platform string, err error) {
-		slog.Error("Notification failed",
-			"error_type", "notification_error",
-			"platform", platform,
-			"item_title", item.Title,
-			"url", item.Link,
-			"error", err,
-		)
+func postToSlack(items []NotificationItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	// Check config from first item
+	if !items[0].EnableSlack || items[0].SlackChannelID == "" {
+		return nil
 	}
 
-	if item.EnableSlack && item.SlackChannelID != "" {
-		if err := postToSlack(item); err != nil {
-			logError("slack", err)
-			errs = append(errs, fmt.Sprintf("Slack: %v", err))
-		}
-	}
-
-	if item.EnableMastodon {
-		if err := postToMastodon(ctx, item); err != nil {
-			logError("mastodon", err)
-			errs = append(errs, fmt.Sprintf("Mastodon: %v", err))
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("%s", strings.Join(errs, ", "))
-	}
-	return nil
-}
-
-func postToSlack(item NotificationItem) error {
 	api := slack.New(slackBotToken)
 
+	var sb strings.Builder
+	for i, item := range items {
+		if i > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(item.Format(true))
+	}
+
 	_, _, err := api.PostMessage(
-		item.SlackChannelID,
-		slack.MsgOptionText(item.Format(true), false),
+		items[0].SlackChannelID,
+		slack.MsgOptionText(sb.String(), false),
 	)
 	return err
 }
 
 func postToMastodon(ctx context.Context, item NotificationItem) error {
+	if !item.EnableMastodon {
+		return nil
+	}
+	defer time.Sleep(notificationDelay)
+
 	accessToken := mastodonAccessToken
 	if item.MastodonAccessToken != "" {
 		accessToken = item.MastodonAccessToken
