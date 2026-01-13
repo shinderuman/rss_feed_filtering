@@ -212,6 +212,7 @@ func (t *AnthropicTranslator) Translate(ctx context.Context, prompt string) (str
 			Messages: []anthropic.MessageParam{
 				anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
 			},
+			Temperature: anthropic.Float(0.0),
 		})
 
 		if err != nil {
