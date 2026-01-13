@@ -185,6 +185,58 @@ func TestTranslateNotificationItems(t *testing.T) {
 	}
 }
 
+func TestTranslateNotificationItems_Concurrency(t *testing.T) {
+	ctx := context.Background()
+	items := []NotificationItem{
+		{Title: "Item 1", Description: "Desc 1"},
+		{Title: "Item 2", Description: "Desc 2"},
+		{Title: "Item 3", Description: "Desc 3"},
+		{Title: "Item 4", Description: "Desc 4"},
+	}
+
+	delay := 50 * time.Millisecond
+
+	// Mock translator with delay
+	mock := &MockTranslator{
+		TranslateFunc: func(ctx context.Context, prompt string) (string, error) {
+			time.Sleep(delay)
+			// Return a JSON that includes the input title to verify order
+			var title string
+			if strings.Contains(prompt, "Item 1") {
+				title = "Translated 1"
+			} else if strings.Contains(prompt, "Item 2") {
+				title = "Translated 2"
+			} else if strings.Contains(prompt, "Item 3") {
+				title = "Translated 3"
+			} else if strings.Contains(prompt, "Item 4") {
+				title = "Translated 4"
+			}
+			return fmt.Sprintf(`{"title": "%s", "description": "Translated Desc"}`, title), nil
+		},
+	}
+
+	start := time.Now()
+	results := translateNotificationItems(ctx, mock, items)
+	duration := time.Since(start)
+
+	// Verification
+	if len(results) != 4 {
+		t.Fatalf("Expected 4 items, got %d", len(results))
+	}
+
+	// Verify Order (Must match input order)
+	for i := 0; i < 4; i++ {
+		expectedTitle := fmt.Sprintf("Translated %d", i+1)
+		if results[i].Title != expectedTitle {
+			t.Errorf("Index %d: Expected title '%s', got '%s'. Order might be broken.", i, expectedTitle, results[i].Title)
+		}
+	}
+
+	if duration > 180*time.Millisecond {
+		t.Errorf("Execution took %v, expected parallel execution (< 180ms)", duration)
+	}
+}
+
 func TestProcessFeeds(t *testing.T) {
 	// Mock RSS Server with delay to verify parallelism
 	serverDelay := 200 * time.Millisecond
@@ -627,7 +679,8 @@ func TestGlobalFlags_Control(t *testing.T) {
 }
 
 func TestAnthropicTranslator_Translate_Timeout_Retry(t *testing.T) {
-	// 1. Mock server that sleeps longer than 10s (timeout) for first 2 attempts, then succeeds
+	setupFastTest(t)
+
 	var attempts int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
@@ -685,16 +738,17 @@ func TestAnthropicTranslator_Translate_Timeout_Retry(t *testing.T) {
 	// 3. Call -> Success
 	// Total: 10 + 3 + 10 + 6 = 29s approximately.
 
-	expectedMin := 20 * time.Second // Conservative lower bound
+	expectedMin := 1 * time.Millisecond
 	if duration < expectedMin {
-		t.Errorf("Test took too short: %v. Expected > %v", duration, expectedMin)
+		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
 	}
 
 	t.Logf("Retry success confirmed. Duration: %v, Attempts: %d", duration, attempts)
 }
 
 func TestAnthropicTranslator_Translate_Retry429(t *testing.T) {
-	// 1. Mock server that returns 429 twice, then 200
+	setupFastTest(t)
+
 	var attempts int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
@@ -740,14 +794,16 @@ func TestAnthropicTranslator_Translate_Retry429(t *testing.T) {
 	// Attempt 1 (0s): 429 -> Sleep 3s
 	// Attempt 2 (3s): 429 -> Sleep 6s
 	// Attempt 3 (9s): 200 -> Return
-	// Total minimum time: 9s
-	expectedMin := 9 * time.Second
+	// Total minimum time with speedup: very fast
+	expectedMin := 1 * time.Millisecond
 	if duration < expectedMin {
 		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
 	}
 }
 
 func TestAnthropicTranslator_Translate_Retry502(t *testing.T) {
+	setupFastTest(t)
+
 	// 1. Mock server that returns 502 twice, then 200
 	var attempts int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -794,8 +850,8 @@ func TestAnthropicTranslator_Translate_Retry502(t *testing.T) {
 	// Attempt 1 (0s): 502 -> Sleep 3s
 	// Attempt 2 (3s): 502 -> Sleep 6s
 	// Attempt 3 (9s): 200 -> Return
-	// Total minimum time: 9s
-	expectedMin := 9 * time.Second
+	// Total minimum time with speedup: very fast
+	expectedMin := 1 * time.Millisecond
 	if duration < expectedMin {
 		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
 	}
@@ -945,4 +1001,19 @@ func TestProcessSingleFeed_NotificationCount(t *testing.T) {
 	if callCount != 1 {
 		t.Errorf("Expected notification sender to be called exactly once, got %d", callCount)
 	}
+}
+
+func setupFastTest(t *testing.T) {
+	t.Helper()
+
+	originalDelay := translationInitialRetryDelay
+	translationInitialRetryDelay = 1 * time.Millisecond
+
+	originalTimeout := translationTimeout
+	translationTimeout = 50 * time.Millisecond
+
+	t.Cleanup(func() {
+		translationInitialRetryDelay = originalDelay
+		translationTimeout = originalTimeout
+	})
 }

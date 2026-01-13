@@ -35,19 +35,18 @@ import (
 )
 
 const (
-	userAgent                    = "RSS-Filter-Bot/1.0"
-	defaultTimeout               = 10 * time.Second
-	anthropicMaxTokens           = 1024
-	mastodonMaxStatusLength      = 500
-	delayedStartIndex            = 1
-	domainDelay                  = 500 * time.Millisecond
-	notificationDelay            = 200 * time.Millisecond // Initial notification limit for new feeds
-	initialNotificationLimit     = 5
-	rssHistoryMultiplier         = 2.0
-	translationTimeout           = 10 * time.Second
-	translationRetryCount        = 5
-	translationInitialRetryDelay = 3 * time.Second
-	gracefulShutdownBuffer       = 2 * time.Second
+	userAgent                = "RSS-Filter-Bot/1.0"
+	defaultTimeout           = 10 * time.Second
+	anthropicMaxTokens       = 1024
+	mastodonMaxStatusLength  = 500
+	delayedStartIndex        = 1
+	domainDelay              = 500 * time.Millisecond
+	notificationDelay        = 200 * time.Millisecond // Initial notification limit for new feeds
+	initialNotificationLimit = 5
+	rssHistoryMultiplier     = 2.0
+	translationRetryCount    = 5
+	gracefulShutdownBuffer   = 2 * time.Second
+	translationConcurrency   = 3
 
 	// 1: FeedTitle, 2: Title, 3: Link, 4: Description, 5: PreviousTitle, 6: PreviousLink
 	slackFormatDelayed = `*<%[6]s|[%[1]s] %[5]s>*
@@ -96,17 +95,19 @@ Description: %s
 )
 
 var (
-	s3Bucket              string
-	s3ConfigKey           string
-	s3StateKey            string
-	slackBotToken         string
-	mastodonServer        string
-	mastodonAccessToken   string
-	anthropicAuthToken    string
-	anthropicBaseURL      string
-	anthropicDefaultModel string
-	urlRegex              = regexp.MustCompile(`https?://[^\s]+`)
-	senderFunc            = sendNotificationItems
+	s3Bucket                     string
+	s3ConfigKey                  string
+	s3StateKey                   string
+	slackBotToken                string
+	mastodonServer               string
+	mastodonAccessToken          string
+	anthropicAuthToken           string
+	anthropicBaseURL             string
+	anthropicDefaultModel        string
+	urlRegex                     = regexp.MustCompile(`https?://[^\s]+`)
+	senderFunc                   = sendNotificationItems
+	translationTimeout           = 10 * time.Second
+	translationInitialRetryDelay = 3 * time.Second
 )
 
 type Config struct {
@@ -463,7 +464,7 @@ func getHostname(urlStr string) string {
 
 func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, appConfig *Config, currentState FeedState) (*FeedState, int, error) {
 
-	feed, respHeaders, statusCode, err := fetchAndParse(url, currentState.LastModified, currentState.ETag)
+	feed, respHeaders, statusCode, err := fetchAndParse(ctx, url, currentState.LastModified, currentState.ETag)
 	if err != nil {
 		return nil, statusCode, err
 	}
@@ -508,7 +509,7 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 	return &nextState, statusCode, nil
 }
 
-func fetchAndParse(url string, lastModified, etag string) (*gofeed.Feed, http.Header, int, error) {
+func fetchAndParse(ctx context.Context, url string, lastModified, etag string) (*gofeed.Feed, http.Header, int, error) {
 	headers := make(map[string]string)
 	if lastModified != "" {
 		headers["If-Modified-Since"] = lastModified
@@ -517,7 +518,7 @@ func fetchAndParse(url string, lastModified, etag string) (*gofeed.Feed, http.He
 		headers["If-None-Match"] = etag
 	}
 
-	content, respHeaders, statusCode, err := fetchFeedContent(url, headers)
+	content, respHeaders, statusCode, err := fetchFeedContent(ctx, url, headers)
 	if err != nil {
 		return nil, nil, statusCode, err
 	}
@@ -534,9 +535,9 @@ func fetchAndParse(url string, lastModified, etag string) (*gofeed.Feed, http.He
 	return feed, respHeaders, statusCode, nil
 }
 
-func fetchFeedContent(feedURL string, headers map[string]string) ([]byte, http.Header, int, error) {
+func fetchFeedContent(ctx context.Context, feedURL string, headers map[string]string) ([]byte, http.Header, int, error) {
 	client := &http.Client{Timeout: defaultTimeout}
-	req, err := http.NewRequest("GET", feedURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -795,39 +796,55 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 }
 
 func translateNotificationItems(ctx context.Context, translator Translator, items []NotificationItem) []NotificationItem {
+	results := make([]NotificationItem, len(items))
+
+	sem := make(chan struct{}, translationConcurrency)
+	var wg sync.WaitGroup
+
+	for i, item := range items {
+		wg.Add(1)
+		go func(i int, item NotificationItem) {
+			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			results[i] = translateSingleItem(ctx, translator, item)
+		}(i, item)
+	}
+
+	wg.Wait()
+	return results
+}
+
+func translateSingleItem(ctx context.Context, translator Translator, item NotificationItem) NotificationItem {
+	prompt := fmt.Sprintf(translationPromptTemplate, item.Title, item.Description)
+
+	resp, err := translator.Translate(ctx, prompt)
+	if err != nil {
+		slog.Error("Failed to translate item", "title", item.Title, "error", err)
+		return item
+	}
+
 	type TranslationResponse struct {
 		Title       string `json:"title"`
 		Description string `json:"description"`
 	}
 
-	var translatedItems []NotificationItem
-	for _, item := range items {
-		prompt := fmt.Sprintf(translationPromptTemplate, item.Title, item.Description)
-
-		resp, err := translator.Translate(ctx, prompt)
-		if err != nil {
-			slog.Error("Failed to translate item", "title", item.Title, "error", err)
-			translatedItems = append(translatedItems, item)
-			continue
-		}
-
-		var translationResp TranslationResponse
-		if err := json.Unmarshal([]byte(resp), &translationResp); err != nil {
-			slog.Error("Failed to unmarshal translation response", "response", resp, "error", err)
-			translatedItems = append(translatedItems, item)
-			continue
-		}
-
-		if translationResp.Title != "" {
-			item.Title = translationResp.Title
-		}
-		if translationResp.Description != "" {
-			item.Description = translationResp.Description
-		}
-
-		translatedItems = append(translatedItems, item)
+	var translationResp TranslationResponse
+	if err := json.Unmarshal([]byte(resp), &translationResp); err != nil {
+		slog.Error("Failed to unmarshal translation response", "response", resp, "error", err)
+		return item
 	}
-	return translatedItems
+
+	if translationResp.Title != "" {
+		item.Title = translationResp.Title
+	}
+	if translationResp.Description != "" {
+		item.Description = translationResp.Description
+	}
+
+	return item
 }
 
 func executeWithRetry(ctx context.Context, op func() (string, error)) (string, error) {
