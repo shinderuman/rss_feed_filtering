@@ -15,9 +15,17 @@ GoとAWS Lambdaで構築されたサーバーレスRSS通知サービスです�
 - **状態管理**:
   - S3上の `state.json` に各フィードの最終通知位置（LastLink）や更新日時（LastPubDate）を保存。
   - 重複通知を防止し、効率的な差分チェックを実現（ETag/Last-Modified対応）。
+  - 履歴（SeenLinks）の保持数は、フィードのアイテム数に応じて動的に調整されます（通常アイテム数の2.0倍）。
 - **自動翻訳**:
   - Anthropic API (Claude) を使用して、フィードのタイトルと説明を日本語に翻訳・要約可能。
+  - タイトルと説明を1リクエストでバッチ処理し、コストとレイテンシを最適化。
+  - タイムアウト、レートリミット (429)、サーバーエラー (502) に対する堅牢なリトライロジックを搭載。
   - フィードごとに有効/無効を設定可能。
+- **並列処理**:
+  - 複数のフィード設定を並列に処理し、実行時間を短縮。
+  - 同一ドメインへのアクセスは直列化し、サーバーへの過負荷を防止（ドメイン単位のレートリミット）。
+- **Graceful Shutdown**:
+  - AWS Lambdaのタイムアウト（Context Deadline）を検知し、強制終了の直前に処理状態（SeenLinksなど）を確実にS3へ保存。
 - **サーバーレス**: AWS Lambda上で動作し、イベントブリッジ等で定期実行することを想定。
 
 ## 構成
@@ -98,6 +106,8 @@ S3に配置するJSON設定ファイルの形式です。
 {
     "global_exclude_keywords": ["PR", "広告"],
     "delayed_domains": ["https://kimicomi.com"],
+    "enable_slack": true,
+    "enable_mastodon": true,
     "configs": [
         {
             "include_keywords": [
@@ -109,6 +119,7 @@ S3に配置するJSON設定ファイルの形式です。
             "urls": ["https://example.com/feed.xml"],
             "slack_channel_id": "C0123456789",
             "enable_mastodon": true,
+            "mastodon_access_token": "your_custom_token_if_needed",
             "enable_translation": true
         }
     ]
@@ -122,6 +133,8 @@ S3に配置するJSON設定ファイルの形式です。
 |---|---|---|---|
 | `global_exclude_keywords` | []string | 任意 | 全フィードに適用される除外キーワード。 |
 | `delayed_domains` | []string | 任意 | 遅延配信（常に1つ前の記事を対象とする）を適用するドメインのリスト。 |
+| `enable_slack` | bool | 任意 | **Global Switch**: `false` (デフォルト) の場合、全フィードのSlack通知を停止します。使用するには `true` に設定してください。 |
+| `enable_mastodon` | bool | 任意 | **Global Switch**: `false` (デフォルト) の場合、全フィードのMastodon通知を停止します。使用するには `true` に設定してください。 |
 | `configs` | []FeedFilterConfig | **必須** | フィードごとの設定リスト（詳細は後述）。 |
 
 
@@ -131,7 +144,8 @@ S3に配置するJSON設定ファイルの形式です。
 |---|---|---|---|
 | `urls` | []string | **必須** | RSSフィードのURLリスト。 |
 | `slack_channel_id` | string | 任意 | 通知先のSlackチャンネルID（`C...`）。未設定の場合はSlack通知が行われません。 |
-| `enable_mastodon` | bool | 任意 | `true` の場合、Mastodonへの投稿を行います（要設定）。 |
+| `enable_mastodon` | bool | 任意 | `true` の場合、Mastodonへの投稿を行います（要設定）。ただしグローバル設定が `false` の場合は送信されません。 |
+| `mastodon_access_token` | string | 任意 | このフィード専用のMastodonアクセストークン。未設定の場合は環境変数のデフォルトトークンが使用されます。 |
 | `enable_translation` | bool | 任意 | `true` の場合、Anthropic APIを使用してタイトルと説明を日本語に翻訳します。 |
 | `include_keywords` | []string | 任意 | 必須キーワード。設定されている場合、これらのキーワードの**いずれか**を含む記事のみ通知されます（OR条件）。 |
 | `exclude_keywords` | []string | 任意 | 除外キーワード。設定されている場合、これらのキーワードの**いずれか**を含むの記事は通知から除外されます（最優先）。 |
