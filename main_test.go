@@ -42,11 +42,7 @@ func TestUpdateStateWithLatestItem(t *testing.T) {
 
 	nextState := &FeedState{}
 
-	// Mock maxSeenLinks for test?
-	// It's a const in main.go, hard to mock directly without changing code structure.
-	// But we can test basic appending.
-	// We can trust the const is 100. If we want to test truncation, we need 101 items.
-	// Update: Function now takes feed count for dynamic limit. We pass 100 so limit is 200, no truncation for this test.
+	// Feed count 100 -> limit 200, no truncation
 	updateStateWithLatestItem(nextState, current, notifyItems, feed, "", nil, 100)
 
 	expected := []string{"new1", "new2", "old1", "old2"}
@@ -224,11 +220,11 @@ func TestTranslateNotificationItems_Concurrency(t *testing.T) {
 		t.Fatalf("Expected 4 items, got %d", len(results))
 	}
 
-	// Verify Order (Must match input order)
+	// Verify Order
 	for i := 0; i < 4; i++ {
 		expectedTitle := fmt.Sprintf("Translated %d", i+1)
 		if results[i].Title != expectedTitle {
-			t.Errorf("Index %d: Expected title '%s', got '%s'. Order might be broken.", i, expectedTitle, results[i].Title)
+			t.Errorf("Index %d: Expected title '%s', got '%s'", i, expectedTitle, results[i].Title)
 		}
 	}
 
@@ -280,7 +276,7 @@ func TestProcessFeeds(t *testing.T) {
 	}
 
 	start := time.Now()
-	err := processFeeds(ctx, appConfig, oldState, saveFunc)
+	_, err := processFeeds(ctx, appConfig, oldState, saveFunc)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -328,8 +324,6 @@ func TestProcessFeeds_InnerParallelism(t *testing.T) {
 	ctx := context.Background()
 
 	// Create ONE config with 2 URLs having DIFFERENT HOSTNAMES
-	// URL1: 127.0.0.1 (default ts.URL)
-	// URL2: localhost (modified)
 	url1 := ts.URL
 	url2 := strings.Replace(ts.URL, "127.0.0.1", "localhost", 1)
 
@@ -353,7 +347,7 @@ func TestProcessFeeds_InnerParallelism(t *testing.T) {
 	}
 
 	start := time.Now()
-	err := processFeeds(ctx, appConfig, oldState, saveFunc)
+	notifications, err := processFeeds(ctx, appConfig, oldState, saveFunc)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -375,6 +369,15 @@ func TestProcessFeeds_InnerParallelism(t *testing.T) {
 	// If separated (diff domain): parallel -> 400ms
 	if elapsed >= 600*time.Millisecond {
 		t.Errorf("Execution took %v, expected less than 600ms (inner parallel execution failed)", elapsed)
+	}
+
+	// Verification of aggregation
+	totalNotifications := 0
+	for _, items := range notifications {
+		totalNotifications += len(items)
+	}
+	if totalNotifications != 2 {
+		t.Errorf("Expected 2 total notifications, got %d", totalNotifications)
 	}
 }
 
@@ -452,8 +455,7 @@ func TestProcessFeeds_ParallelStateUpdate(t *testing.T) {
 		return nil
 	}
 
-	// 3. Run
-	err := processFeeds(ctx, appConfig, oldState, saveFunc)
+	_, err := processFeeds(ctx, appConfig, oldState, saveFunc)
 	if err != nil {
 		t.Fatalf("processFeeds failed: %v", err)
 	}
@@ -540,7 +542,7 @@ func TestProcessFeeds_SaveOnce(t *testing.T) {
 		return nil
 	}
 
-	err := processFeeds(ctx, appConfig, oldState, saveFunc)
+	_, err := processFeeds(ctx, appConfig, oldState, saveFunc)
 	if err != nil {
 		t.Fatalf("processFeeds failed: %v", err)
 	}
@@ -573,7 +575,7 @@ func TestProcessFeeds_Idempotency(t *testing.T) {
 		return nil
 	}
 
-	if err := processFeeds(ctx, appConfig, state1, saveFunc); err != nil {
+	if _, err := processFeeds(ctx, appConfig, state1, saveFunc); err != nil {
 		t.Fatalf("Run 1 failed: %v", err)
 	}
 
@@ -583,15 +585,6 @@ func TestProcessFeeds_Idempotency(t *testing.T) {
 		t.Fatalf("Run 1: Expected 1 seen link, got %d", len(savedState.Feeds[key].SeenLinks))
 	}
 
-	// Run 2: Re-run with Saved State
-	// The feed content is exactly the same. Should produce NO notifications and maintain state.
-	// (Note: In real app, we track LastLink/SeenLinks. processSingleFeed should see link is in SeenLinks and produce 0 notifyItems)
-
-	// We need to capture if any notifications were sent.
-	// Since processFeeds calls processSingleFeed which calls sendNotificationItems (which logs),
-	// we can't easily capture output here without refactoring sendNotificationItems injection.
-	// BUT, we can check the State. If 0 items were found, LastLink/SeenLinks shouldn't change (or just be re-asserted).
-
 	state2 := savedState
 	var savedState2 *State
 	saveFunc2 := func(s *State) error {
@@ -599,12 +592,15 @@ func TestProcessFeeds_Idempotency(t *testing.T) {
 		return nil
 	}
 
-	if err := processFeeds(ctx, appConfig, state2, saveFunc2); err != nil {
+	notifications2, err := processFeeds(ctx, appConfig, state2, saveFunc2)
+	if err != nil {
 		t.Fatalf("Run 2 failed: %v", err)
 	}
 
-	// If processFeeds found 0 new items to notify, it still runs and might save state (e.g. LastModified might update if server doesn't support 304).
-	// But SeenLinks should NOT grow.
+	if len(notifications2) > 0 {
+		t.Errorf("Run 2: Expected 0 notifications, got %d groups", len(notifications2))
+	}
+
 	if len(savedState2.Feeds[key].SeenLinks) != 1 {
 		t.Errorf("Run 2: Expected SeenLinks length to remain 1, got %d", len(savedState2.Feeds[key].SeenLinks))
 	}
@@ -726,18 +722,6 @@ func TestAnthropicTranslator_Translate_Timeout_Retry(t *testing.T) {
 		t.Errorf("Expected 'Translated', got '%s'", res)
 	}
 
-	// Expected Timing:
-	// Attempt 1 (0s): Timeout (10s) -> Sleep 3s
-	// Attempt 2 (13s): Timeout (10s) -> Sleep 6s
-	// Attempt 3 (29s): Success (immediate)
-	// Total minimum time: 29s
-	// However, if the http.Client timeout fires at 10s, the "Wait" in executeWithRetry happens AFTER the error return.
-	// So:
-	// 1. Call -> 10s -> Timeout Err -> Sleep 3s
-	// 2. Call -> 10s -> Timeout Err -> Sleep 6s
-	// 3. Call -> Success
-	// Total: 10 + 3 + 10 + 6 = 29s approximately.
-
 	expectedMin := 1 * time.Millisecond
 	if duration < expectedMin {
 		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
@@ -790,11 +774,6 @@ func TestAnthropicTranslator_Translate_Retry429(t *testing.T) {
 		t.Errorf("Expected 'Success', got '%s'", res)
 	}
 
-	// Expected Timing:
-	// Attempt 1 (0s): 429 -> Sleep 3s
-	// Attempt 2 (3s): 429 -> Sleep 6s
-	// Attempt 3 (9s): 200 -> Return
-	// Total minimum time with speedup: very fast
 	expectedMin := 1 * time.Millisecond
 	if duration < expectedMin {
 		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
@@ -846,11 +825,6 @@ func TestAnthropicTranslator_Translate_Retry502(t *testing.T) {
 		t.Errorf("Expected 'Success', got '%s'", res)
 	}
 
-	// Expected Timing:
-	// Attempt 1 (0s): 502 -> Sleep 3s
-	// Attempt 2 (3s): 502 -> Sleep 6s
-	// Attempt 3 (9s): 200 -> Return
-	// Total minimum time with speedup: very fast
 	expectedMin := 1 * time.Millisecond
 	if duration < expectedMin {
 		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
@@ -883,14 +857,11 @@ func TestProcessFeeds_TimeoutSave(t *testing.T) {
 	}
 
 	// Create a context with a deadline that triggers graceful shutdown.
-	// We set deadline to Now() + gracefulShutdownBuffer + 100ms.
-	// The shutdownTimer uses (deadline - gracefulShutdownBuffer), so it will fire in 100ms.
-	// The feed takes 500ms, so it should be interrupted by the shutdown logic.
 	ctx, cancel := context.WithTimeout(context.Background(), gracefulShutdownBuffer+100*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
-	err := processFeeds(ctx, appConfig, oldState, saveFunc)
+	_, err := processFeeds(ctx, appConfig, oldState, saveFunc)
 	elapsed := time.Since(start)
 
 	// We expect an error "graceful shutdown due to timeout"
@@ -910,12 +881,7 @@ func TestProcessFeeds_TimeoutSave(t *testing.T) {
 	t.Logf("Elapsed: %v", elapsed)
 }
 func TestUpdateStateWithLatestItem_Multiplier(t *testing.T) {
-	// rssHistoryMultiplier is 2.0 (const in main.go)
-
 	// Case 1: Small Feed (Feed Count 30 -> Limit 60)
-	// We simulate existing seen links (40 items) + new items (30 items) = 70 items total.
-	// Expected: Truncated to 60.
-
 	current1 := FeedState{SeenLinks: make([]string, 40)}
 	for i := 0; i < 40; i++ {
 		current1.SeenLinks[i] = fmt.Sprintf("old%d", i)
@@ -927,7 +893,7 @@ func TestUpdateStateWithLatestItem_Multiplier(t *testing.T) {
 	}
 
 	next1 := &FeedState{}
-	updateStateWithLatestItem(next1, current1, notifyItems1, &gofeed.Feed{}, "", nil, 30) // Feed Count 30
+	updateStateWithLatestItem(next1, current1, notifyItems1, &gofeed.Feed{}, "", nil, 30)
 
 	expectedLimit1 := 60
 	if len(next1.SeenLinks) != expectedLimit1 {
@@ -935,9 +901,6 @@ func TestUpdateStateWithLatestItem_Multiplier(t *testing.T) {
 	}
 
 	// Case 2: Large Feed (Feed Count 200 -> Limit 400)
-	// We simulate existing (200) + new (250) = 450 items.
-	// Expected: Truncated to 400.
-
 	current2 := FeedState{SeenLinks: make([]string, 200)}
 	for i := 0; i < 200; i++ {
 		current2.SeenLinks[i] = fmt.Sprintf("old%d", i)
@@ -949,7 +912,7 @@ func TestUpdateStateWithLatestItem_Multiplier(t *testing.T) {
 	}
 
 	next2 := &FeedState{}
-	updateStateWithLatestItem(next2, current2, notifyItems2, &gofeed.Feed{}, "", nil, 200) // Feed Count 200
+	updateStateWithLatestItem(next2, current2, notifyItems2, &gofeed.Feed{}, "", nil, 200)
 
 	expectedLimit2 := 400
 	if len(next2.SeenLinks) != expectedLimit2 {
@@ -957,16 +920,13 @@ func TestUpdateStateWithLatestItem_Multiplier(t *testing.T) {
 	}
 
 	// Case 3: Empty Feed / Error (Feed Count 0 -> No Truncation)
-	// Even if we have tons of items, if feed count reports 0 (e.g. failed fetch but somehow updated?),
-	// specific logic prevents truncation.
-
-	current3 := FeedState{SeenLinks: make([]string, 500)} // Huge existing
+	current3 := FeedState{SeenLinks: make([]string, 500)}
 	for i := 0; i < 500; i++ {
 		current3.SeenLinks[i] = "item"
 	}
 
 	next3 := &FeedState{}
-	updateStateWithLatestItem(next3, current3, []NotificationItem{}, &gofeed.Feed{}, "", nil, 0) // Feed Count 0
+	updateStateWithLatestItem(next3, current3, []NotificationItem{}, &gofeed.Feed{}, "", nil, 0)
 
 	if len(next3.SeenLinks) != 500 {
 		t.Errorf("Case 3: Expected no truncation (500), got %d", len(next3.SeenLinks))
@@ -974,14 +934,6 @@ func TestUpdateStateWithLatestItem_Multiplier(t *testing.T) {
 }
 
 func TestProcessSingleFeed_NotificationCount(t *testing.T) {
-	// Mock senderFunc
-	callCount := 0
-	originalSender := senderFunc
-	senderFunc = func(ctx context.Context, items []NotificationItem) {
-		callCount++
-	}
-	defer func() { senderFunc = originalSender }()
-
 	// Start Mock Server to return this feed
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		feedStr := `<rss version="2.0"><channel><item><title>New Item</title><link>new</link></item></channel></rss>`
@@ -995,11 +947,14 @@ func TestProcessSingleFeed_NotificationCount(t *testing.T) {
 	state := FeedState{SeenLinks: []string{}}
 
 	// Exec
-	processSingleFeed(ctx, ts.URL, cfg, nil, &Config{}, state)
+	_, items, _, err := processSingleFeed(ctx, ts.URL, cfg, nil, &Config{}, state)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 
 	// Verify
-	if callCount != 1 {
-		t.Errorf("Expected notification sender to be called exactly once, got %d", callCount)
+	if len(items) != 1 {
+		t.Errorf("Expected 1 notification item, got %d", len(items))
 	}
 }
 

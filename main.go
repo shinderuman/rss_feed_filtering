@@ -105,7 +105,6 @@ var (
 	anthropicBaseURL             string
 	anthropicDefaultModel        string
 	urlRegex                     = regexp.MustCompile(`https?://[^\s]+`)
-	senderFunc                   = sendNotificationItems
 	translationTimeout           = 10 * time.Second
 	translationInitialRetryDelay = 3 * time.Second
 )
@@ -153,8 +152,9 @@ type NotificationItem struct {
 }
 
 type FeedResult struct {
-	Key   string
-	State FeedState
+	Key           string
+	State         FeedState
+	Notifications []NotificationItem
 }
 
 type SaveStateFunc func(*State) error
@@ -267,12 +267,14 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("State load error: %w", err)
 	}
 
-	processErr := processFeeds(ctx, appConfig, state, func(s *State) error {
+	notifications, processErr := processFeeds(ctx, appConfig, state, func(s *State) error {
 		return saveState(ctx, s3Client, s)
 	})
 	if processErr != nil {
 		slog.Error("Some feeds failed", "error", processErr)
 	}
+
+	sendAggregatedNotifications(ctx, notifications)
 
 	return processErr
 }
@@ -328,7 +330,7 @@ func loadState(ctx context.Context, client *s3.Client) (*State, error) {
 	return &state, nil
 }
 
-func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveStateFunc SaveStateFunc) error {
+func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveStateFunc SaveStateFunc) (map[string][]NotificationItem, error) {
 	newState := &State{Feeds: make(map[string]FeedState)}
 	maps.Copy(newState.Feeds, oldState.Feeds)
 
@@ -346,16 +348,17 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveS
 		close(resultCh)
 	}()
 
-	if err := collectResults(ctx, resultCh, newState, saveStateFunc); err != nil {
-		return err
+	allNotifications, err := collectResults(ctx, resultCh, newState, saveStateFunc)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := saveStateFunc(newState); err != nil {
 		slog.Error("Failed to save state", "error", err)
-		return err
+		return allNotifications, err
 	}
 
-	return nil
+	return allNotifications, nil
 }
 
 func processFeedConfig(ctx context.Context, cfg FeedFilterConfig, appConfig *Config, oldState *State, out chan<- FeedResult, wg *sync.WaitGroup) {
@@ -378,7 +381,9 @@ func processFeedConfig(ctx context.Context, cfg FeedFilterConfig, appConfig *Con
 	innerWg.Wait()
 }
 
-func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *State, saveStateFunc SaveStateFunc) error {
+func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *State, saveStateFunc SaveStateFunc) (map[string][]NotificationItem, error) {
+	notificationsByChannel := make(map[string][]NotificationItem)
+
 	var shutdownCh <-chan time.Time
 	if deadline, ok := ctx.Deadline(); ok {
 		shutdownTimer := time.NewTimer(time.Until(deadline) - gracefulShutdownBuffer)
@@ -390,24 +395,29 @@ func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *S
 		select {
 		case res, ok := <-resultCh:
 			if !ok {
-				return nil
+				return notificationsByChannel, nil
 			}
 			newState.Feeds[res.Key] = res.State
+
+			if len(res.Notifications) > 0 {
+				params := res.Notifications[0]
+				notificationsByChannel[params.SlackChannelID] = append(notificationsByChannel[params.SlackChannelID], res.Notifications...)
+			}
 
 		case <-shutdownCh:
 			slog.Warn("Approaching Lambda timeout, saving state and performing graceful shutdown")
 			if err := saveStateFunc(newState); err != nil {
 				slog.Error("Failed to save state during graceful shutdown", "error", err)
-				return err
+				return nil, err
 			}
-			return fmt.Errorf("graceful shutdown due to timeout")
+			return nil, fmt.Errorf("graceful shutdown due to timeout")
 
 		case <-ctx.Done():
 			slog.Warn("Context done, saving state", "error", ctx.Err())
 			if err := saveStateFunc(newState); err != nil {
 				slog.Error("Failed to save state on context done", "error", err)
 			}
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
 }
@@ -423,7 +433,7 @@ func processDomainUrls(ctx context.Context, urls []string, cfg FeedFilterConfig,
 		feedKey := fmt.Sprintf("%x", md5.Sum([]byte(url)))
 		currentState := oldState.Feeds[feedKey]
 
-		updatedFeedState, statusCode, err := processSingleFeed(ctx, url, cfg, excludeWords, appConfig, currentState)
+		updatedFeedState, notifyItems, statusCode, err := processSingleFeed(ctx, url, cfg, excludeWords, appConfig, currentState)
 
 		if err != nil {
 			errorType := "fetch_error"
@@ -435,8 +445,9 @@ func processDomainUrls(ctx context.Context, urls []string, cfg FeedFilterConfig,
 		}
 
 		out <- FeedResult{
-			Key:   feedKey,
-			State: *updatedFeedState,
+			Key:           feedKey,
+			State:         *updatedFeedState,
+			Notifications: notifyItems,
 		}
 	}
 }
@@ -463,15 +474,15 @@ func getHostname(urlStr string) string {
 	return u.Hostname()
 }
 
-func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, appConfig *Config, currentState FeedState) (*FeedState, int, error) {
+func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig, excludeWords []string, appConfig *Config, currentState FeedState) (*FeedState, []NotificationItem, int, error) {
 
 	feed, respHeaders, statusCode, err := fetchAndParse(ctx, url, currentState.LastModified, currentState.ETag)
 	if err != nil {
-		return nil, statusCode, err
+		return nil, nil, statusCode, err
 	}
 
 	if statusCode == http.StatusNotModified {
-		return &currentState, statusCode, nil
+		return &currentState, nil, statusCode, nil
 	}
 
 	nextState := currentState
@@ -504,10 +515,9 @@ func processSingleFeed(ctx context.Context, url string, feedCfg FeedFilterConfig
 		notifyItems = translateNotificationItems(ctx, translator, notifyItems)
 	}
 
-	senderFunc(ctx, notifyItems)
 	updateStateWithLatestItem(&nextState, currentState, notifyItems, feed, url, appConfig.DelayedDomains, len(feed.Items))
 
-	return &nextState, statusCode, nil
+	return &nextState, notifyItems, statusCode, nil
 }
 
 func fetchAndParse(ctx context.Context, url string, lastModified, etag string) (*gofeed.Feed, http.Header, int, error) {
@@ -619,36 +629,40 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 	return notifyItems
 }
 
-func sendNotificationItems(ctx context.Context, items []NotificationItem) {
-	if len(items) == 0 {
+func sendAggregatedNotifications(ctx context.Context, itemsByChannel map[string][]NotificationItem) {
+	if len(itemsByChannel) == 0 {
 		return
 	}
 
 	var errs []string
 
-	// Mastodon: Send individually
-	for _, item := range items {
-		if err := postToMastodon(ctx, item); err != nil {
+	for _, items := range itemsByChannel {
+		// Mastodon
+		for _, item := range items {
+			if err := postToMastodon(ctx, item); err != nil {
+				slog.Error("Notification failed",
+					"error_type", "notification_error",
+					"platform", "mastodon",
+					"item_title", item.Title,
+					"url", item.Link,
+					"error", err,
+				)
+				errs = append(errs, fmt.Sprintf("Mastodon: %v", err))
+			}
+		}
+
+		// Slack
+		if err := postToSlack(items); err != nil {
 			slog.Error("Notification failed",
 				"error_type", "notification_error",
-				"platform", "mastodon",
-				"item_title", item.Title,
-				"url", item.Link,
+				"platform", "slack",
+				"count", len(items),
 				"error", err,
 			)
-			errs = append(errs, fmt.Sprintf("Mastodon: %v", err))
+			// Get channelID from the first item since we know they are grouped
+			channelID := items[0].SlackChannelID
+			errs = append(errs, fmt.Sprintf("Slack(%s): %v", channelID, err))
 		}
-	}
-
-	// Slack: Send batched
-	if err := postToSlack(items); err != nil {
-		slog.Error("Notification failed",
-			"error_type", "notification_error",
-			"platform", "slack",
-			"count", len(items),
-			"error", err,
-		)
-		errs = append(errs, fmt.Sprintf("Slack: %v", err))
 	}
 
 	if len(errs) > 0 {
@@ -746,7 +760,7 @@ func postToSlack(items []NotificationItem) error {
 	if len(items) == 0 {
 		return nil
 	}
-	// Check config from first item
+
 	if !items[0].EnableSlack || items[0].SlackChannelID == "" {
 		return nil
 	}
