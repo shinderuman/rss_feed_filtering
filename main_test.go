@@ -1037,9 +1037,19 @@ func setupFastTest(t *testing.T) {
 	originalTimeout := translationTimeout
 	translationTimeout = 50 * time.Millisecond
 
+	// Reset global rate limiter state
+	originalLimiter := translationRateLimiter
+	translationRateLimiter = &RateLimiter{}
+
+	originalSemaphore := translationSemaphore
+	// Drain and recreate semaphore to ensure clean state
+	translationSemaphore = make(chan struct{}, translationConcurrency)
+
 	t.Cleanup(func() {
 		translationInitialRetryDelay = originalDelay
 		translationTimeout = originalTimeout
+		translationRateLimiter = originalLimiter
+		translationSemaphore = originalSemaphore
 	})
 }
 
@@ -1091,5 +1101,71 @@ func TestTranslateNotificationItems_RateLimit(t *testing.T) {
 		if diff < 1000*time.Millisecond {
 			t.Errorf("Interval between req %d and %d too short: %v (expected >= 1s)", i, i+1, diff)
 		}
+	}
+}
+
+func TestTranslateNotificationItems_GlobalRateLimit(t *testing.T) {
+	setupFastTest(t)
+	// Override delay for this specific test
+	translationRateLimitDelay = 100 * time.Millisecond
+
+	originalRateLimitDelay := translationRateLimitDelay
+	defer func() { translationRateLimitDelay = originalRateLimitDelay }()
+
+	ctx := context.Background()
+
+	// Shared recorder for all goroutines
+	var requestTimes []time.Time
+	var mu sync.Mutex
+
+	mock := &MockTranslator{
+		TranslateFunc: func(ctx context.Context, prompt string) (string, error) {
+			mu.Lock()
+			requestTimes = append(requestTimes, time.Now())
+			mu.Unlock()
+			return `{"title": "Translated", "description": "Desc"}`, nil
+		},
+	}
+
+	// Simulate 3 concurrent feeds being processed
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			items := []NotificationItem{{Title: "Item", Description: "Desc"}}
+			// Each call creates its own local rate limiter in the current implementation
+			translateNotificationItems(ctx, mock, items)
+		}()
+	}
+	wg.Wait()
+
+	duration := time.Since(start)
+	t.Logf("Total duration: %v", duration)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Sort times
+	sort.Slice(requestTimes, func(i, j int) bool {
+		return requestTimes[i].Before(requestTimes[j])
+	})
+
+	// Check intervals
+	minInterval := translationRateLimitDelay - 20*time.Millisecond // Allow small margin
+	failures := 0
+	for i := 0; i < len(requestTimes)-1; i++ {
+		diff := requestTimes[i+1].Sub(requestTimes[i])
+		if diff < minInterval {
+			t.Logf("Interval between req %d and %d is %v (expected >= %v) - FAILURE", i, i+1, diff, minInterval)
+			failures++
+		}
+	}
+
+	// We expect NO failures if global rate limiting works.
+	if failures > 0 {
+		t.Errorf("Found %d rate limit violations (Global Rate Limit Broken)", failures)
 	}
 }

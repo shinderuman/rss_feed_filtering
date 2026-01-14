@@ -108,7 +108,31 @@ var (
 	translationTimeout           = 10 * time.Second
 	translationInitialRetryDelay = 3 * time.Second
 	translationRateLimitDelay    = 1100 * time.Millisecond
+
+	translationRateLimiter = &RateLimiter{}
+	translationSemaphore   = make(chan struct{}, translationConcurrency)
 )
+
+type RateLimiter struct {
+	mu              sync.Mutex
+	lastRequestTime time.Time
+}
+
+func (r *RateLimiter) Wait(ctx context.Context, delay time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	timeSinceLastRequest := time.Since(r.lastRequestTime)
+	if timeSinceLastRequest < delay {
+		sleepDuration := delay - timeSinceLastRequest
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sleepDuration):
+		}
+	}
+	r.lastRequestTime = time.Now()
+}
 
 type Config struct {
 	GlobalExcludeWords []string           `json:"global_exclude_keywords"`
@@ -833,27 +857,17 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 func translateNotificationItems(ctx context.Context, translator Translator, items []NotificationItem) []NotificationItem {
 	results := make([]NotificationItem, len(items))
 
-	sem := make(chan struct{}, translationConcurrency)
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var lastRequestTime time.Time
 
 	for i, item := range items {
 		wg.Add(1)
 		go func(i int, item NotificationItem) {
 			defer wg.Done()
 
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			translationSemaphore <- struct{}{}
+			defer func() { <-translationSemaphore }()
 
-			mu.Lock()
-			timeSinceLastRequest := time.Since(lastRequestTime)
-			if timeSinceLastRequest < translationRateLimitDelay {
-				sleepDuration := translationRateLimitDelay - timeSinceLastRequest
-				time.Sleep(sleepDuration)
-			}
-			lastRequestTime = time.Now()
-			mu.Unlock()
+			translationRateLimiter.Wait(ctx, translationRateLimitDelay)
 
 			results[i] = translateSingleItem(ctx, translator, item)
 		}(i, item)
