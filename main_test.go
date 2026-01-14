@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -181,7 +182,7 @@ func TestTranslateNotificationItems(t *testing.T) {
 	}
 }
 
-func TestTranslateNotificationItems_Concurrency(t *testing.T) {
+func TestTranslateNotificationItems_Results(t *testing.T) {
 	ctx := context.Background()
 	items := []NotificationItem{
 		{Title: "Item 1", Description: "Desc 1"},
@@ -190,7 +191,7 @@ func TestTranslateNotificationItems_Concurrency(t *testing.T) {
 		{Title: "Item 4", Description: "Desc 4"},
 	}
 
-	delay := 50 * time.Millisecond
+	delay := 10 * time.Millisecond
 
 	// Mock translator with delay
 	mock := &MockTranslator{
@@ -211,9 +212,7 @@ func TestTranslateNotificationItems_Concurrency(t *testing.T) {
 		},
 	}
 
-	start := time.Now()
 	results := translateNotificationItems(ctx, mock, items)
-	duration := time.Since(start)
 
 	// Verification
 	if len(results) != 4 {
@@ -226,10 +225,6 @@ func TestTranslateNotificationItems_Concurrency(t *testing.T) {
 		if results[i].Title != expectedTitle {
 			t.Errorf("Index %d: Expected title '%s', got '%s'", i, expectedTitle, results[i].Title)
 		}
-	}
-
-	if duration > 180*time.Millisecond {
-		t.Errorf("Execution took %v, expected parallel execution (< 180ms)", duration)
 	}
 }
 
@@ -971,4 +966,55 @@ func setupFastTest(t *testing.T) {
 		translationInitialRetryDelay = originalDelay
 		translationTimeout = originalTimeout
 	})
+}
+
+func TestTranslateNotificationItems_RateLimit(t *testing.T) {
+	ctx := context.Background()
+	items := []NotificationItem{
+		{Title: "Item 1", Description: "Desc 1"},
+		{Title: "Item 2", Description: "Desc 2"},
+		{Title: "Item 3", Description: "Desc 3"},
+	}
+
+	// Mock translator that records timestamp
+	var requestTimes []time.Time
+	var mu sync.Mutex
+
+	mock := &MockTranslator{
+		TranslateFunc: func(ctx context.Context, prompt string) (string, error) {
+			mu.Lock()
+			requestTimes = append(requestTimes, time.Now())
+			mu.Unlock()
+			return `{"title": "Translated", "description": "Desc"}`, nil
+		},
+	}
+
+	start := time.Now()
+	translateNotificationItems(ctx, mock, items)
+	duration := time.Since(start)
+
+	expectedMinTotal := 2000 * time.Millisecond
+
+	if duration < expectedMinTotal {
+		t.Errorf("Total execution time too short. Got %v, expected at least %v", duration, expectedMinTotal)
+	}
+
+	// Verify intervals
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requestTimes) != 3 {
+		t.Fatalf("Expected 3 requests, got %d", len(requestTimes))
+	}
+
+	// Sort times to be sure (though they should be sequential due to mutex in main code)
+	sort.Slice(requestTimes, func(i, j int) bool {
+		return requestTimes[i].Before(requestTimes[j])
+	})
+
+	for i := 0; i < len(requestTimes)-1; i++ {
+		diff := requestTimes[i+1].Sub(requestTimes[i])
+		if diff < 1000*time.Millisecond {
+			t.Errorf("Interval between req %d and %d too short: %v (expected >= 1s)", i, i+1, diff)
+		}
+	}
 }

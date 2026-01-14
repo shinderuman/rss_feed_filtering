@@ -107,6 +107,7 @@ var (
 	urlRegex                     = regexp.MustCompile(`https?://[^\s]+`)
 	translationTimeout           = 10 * time.Second
 	translationInitialRetryDelay = 3 * time.Second
+	translationRateLimitDelay    = 1100 * time.Millisecond
 )
 
 type Config struct {
@@ -815,6 +816,8 @@ func translateNotificationItems(ctx context.Context, translator Translator, item
 
 	sem := make(chan struct{}, translationConcurrency)
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var lastRequestTime time.Time
 
 	for i, item := range items {
 		wg.Add(1)
@@ -823,6 +826,15 @@ func translateNotificationItems(ctx context.Context, translator Translator, item
 
 			sem <- struct{}{}
 			defer func() { <-sem }()
+
+			mu.Lock()
+			timeSinceLastRequest := time.Since(lastRequestTime)
+			if timeSinceLastRequest < translationRateLimitDelay {
+				sleepDuration := translationRateLimitDelay - timeSinceLastRequest
+				time.Sleep(sleepDuration)
+			}
+			lastRequestTime = time.Now()
+			mu.Unlock()
 
 			results[i] = translateSingleItem(ctx, translator, item)
 		}(i, item)
