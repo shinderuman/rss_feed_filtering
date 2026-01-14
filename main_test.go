@@ -368,8 +368,8 @@ func TestProcessFeeds_InnerParallelism(t *testing.T) {
 
 	// Verification of aggregation
 	totalNotifications := 0
-	for _, items := range notifications {
-		totalNotifications += len(items)
+	for _, batch := range notifications {
+		totalNotifications += len(batch)
 	}
 	if totalNotifications != 2 {
 		t.Errorf("Expected 2 total notifications, got %d", totalNotifications)
@@ -823,6 +823,81 @@ func TestAnthropicTranslator_Translate_Retry502(t *testing.T) {
 	expectedMin := 1 * time.Millisecond
 	if duration < expectedMin {
 		t.Errorf("Expected duration >= %v, got %v", expectedMin, duration)
+	}
+}
+
+func TestCollectResults_CollectionLogic(t *testing.T) {
+	// Setup resultCh with mixed items
+	resultCh := make(chan FeedResult, 3)
+
+	// Group 1: Collection Enabled (Channel A) - simulating 2 items from one feed
+	resultCh <- FeedResult{
+		Notifications: []NotificationItem{
+			{Title: "A1", SlackChannelID: "ChannelA", EnableCollection: true},
+			{Title: "A2", SlackChannelID: "ChannelA", EnableCollection: true},
+		},
+	}
+
+	// Group 2: Collection Disabled (Channel A) - separate feed or item
+	resultCh <- FeedResult{
+		Notifications: []NotificationItem{
+			{Title: "A3", SlackChannelID: "ChannelA", EnableCollection: false},
+		},
+	}
+
+	// Group 3: Collection Enabled (Channel B)
+	resultCh <- FeedResult{
+		Notifications: []NotificationItem{
+			{Title: "B1", SlackChannelID: "ChannelB", EnableCollection: true},
+		},
+	}
+
+	close(resultCh)
+
+	newState := &State{Feeds: make(map[string]FeedState)}
+	saveFunc := func(s *State) error { return nil }
+
+	batches, _ := collectResults(context.Background(), resultCh, newState, saveFunc)
+
+	// Expectations:
+	// batch for A1, A2 (grouped)
+	// batch for A3 (individual)
+	// batch for B1 (grouped)
+	// Total 3 batches
+
+	if len(batches) != 3 {
+		t.Errorf("Expected 3 batches, got %d", len(batches))
+	}
+
+	foundA3 := false
+	foundA1A2 := false
+	foundB1 := false
+
+	for _, b := range batches {
+		if len(b) > 0 && b[0].SlackChannelID == "ChannelA" {
+			if len(b) == 1 && b[0].Title == "A3" {
+				foundA3 = true
+			} else if len(b) == 2 {
+				// Order within group should be preserved as inserted
+				if b[0].Title == "A1" && b[1].Title == "A2" {
+					foundA1A2 = true
+				}
+			}
+		} else if len(b) > 0 && b[0].SlackChannelID == "ChannelB" {
+			if len(b) == 1 && b[0].Title == "B1" {
+				foundB1 = true
+			}
+		}
+	}
+
+	if !foundA3 {
+		t.Error("Did not find A3 individual batch")
+	}
+	if !foundA1A2 {
+		t.Error("Did not find A1+A2 grouped batch")
+	}
+	if !foundB1 {
+		t.Error("Did not find B1 grouped batch")
 	}
 }
 

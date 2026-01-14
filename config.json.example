@@ -18,6 +18,7 @@
             ],
             "slack_channel_id": "C012345678",
             "enable_mastodon": true,
+            "enable_collection": true,
             "enable_translation": true,
             "mastodon_access_token": "optional_token_override"
         },
@@ -29,6 +30,7 @@
             ],
             "slack_channel_id": "C987654321",
             "enable_mastodon": false,
+            "enable_collection": false,
             "enable_translation": false
         }
     ]

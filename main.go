@@ -125,6 +125,7 @@ type FeedFilterConfig struct {
 	SlackChannelID      string   `json:"slack_channel_id"`
 	EnableMastodon      bool     `json:"enable_mastodon"`
 	EnableTranslation   bool     `json:"enable_translation"`
+	EnableCollection    bool     `json:"enable_collection"`
 	MastodonAccessToken string   `json:"mastodon_access_token"`
 }
 
@@ -150,6 +151,7 @@ type NotificationItem struct {
 	MastodonAccessToken string
 	PreviousTitle       string
 	PreviousLink        string
+	EnableCollection    bool
 }
 
 type FeedResult struct {
@@ -331,7 +333,7 @@ func loadState(ctx context.Context, client *s3.Client) (*State, error) {
 	return &state, nil
 }
 
-func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveStateFunc SaveStateFunc) (map[string][]NotificationItem, error) {
+func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveStateFunc SaveStateFunc) ([][]NotificationItem, error) {
 	newState := &State{Feeds: make(map[string]FeedState)}
 	maps.Copy(newState.Feeds, oldState.Feeds)
 
@@ -349,17 +351,17 @@ func processFeeds(ctx context.Context, appConfig *Config, oldState *State, saveS
 		close(resultCh)
 	}()
 
-	allNotifications, err := collectResults(ctx, resultCh, newState, saveStateFunc)
+	batches, err := collectResults(ctx, resultCh, newState, saveStateFunc)
 	if err != nil {
 		return nil, err
 	}
 
 	if err := saveStateFunc(newState); err != nil {
 		slog.Error("Failed to save state", "error", err)
-		return allNotifications, err
+		return nil, err
 	}
 
-	return allNotifications, nil
+	return batches, nil
 }
 
 func processFeedConfig(ctx context.Context, cfg FeedFilterConfig, appConfig *Config, oldState *State, out chan<- FeedResult, wg *sync.WaitGroup) {
@@ -382,8 +384,9 @@ func processFeedConfig(ctx context.Context, cfg FeedFilterConfig, appConfig *Con
 	innerWg.Wait()
 }
 
-func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *State, saveStateFunc SaveStateFunc) (map[string][]NotificationItem, error) {
-	notificationsByChannel := make(map[string][]NotificationItem)
+func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *State, saveStateFunc SaveStateFunc) ([][]NotificationItem, error) {
+	var batches [][]NotificationItem
+	groupedItems := make(map[string][]NotificationItem)
 
 	var shutdownCh <-chan time.Time
 	if deadline, ok := ctx.Deadline(); ok {
@@ -396,14 +399,10 @@ func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *S
 		select {
 		case res, ok := <-resultCh:
 			if !ok {
-				return notificationsByChannel, nil
+				return finalizeBatches(batches, groupedItems), nil
 			}
-			newState.Feeds[res.Key] = res.State
-
-			if len(res.Notifications) > 0 {
-				params := res.Notifications[0]
-				notificationsByChannel[params.SlackChannelID] = append(notificationsByChannel[params.SlackChannelID], res.Notifications...)
-			}
+			newBatches := processFeedResult(res, newState, groupedItems)
+			batches = append(batches, newBatches...)
 
 		case <-shutdownCh:
 			slog.Warn("Approaching Lambda timeout, saving state and performing graceful shutdown")
@@ -421,6 +420,27 @@ func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *S
 			return nil, ctx.Err()
 		}
 	}
+}
+
+func processFeedResult(res FeedResult, newState *State, groupedItems map[string][]NotificationItem) [][]NotificationItem {
+	newState.Feeds[res.Key] = res.State
+	var newBatches [][]NotificationItem
+
+	for _, item := range res.Notifications {
+		if item.EnableCollection {
+			groupedItems[item.SlackChannelID] = append(groupedItems[item.SlackChannelID], item)
+		} else {
+			newBatches = append(newBatches, []NotificationItem{item})
+		}
+	}
+	return newBatches
+}
+
+func finalizeBatches(batches [][]NotificationItem, groupedItems map[string][]NotificationItem) [][]NotificationItem {
+	for _, items := range groupedItems {
+		batches = append(batches, items)
+	}
+	return batches
 }
 
 func processDomainUrls(ctx context.Context, urls []string, cfg FeedFilterConfig, appConfig *Config, oldState *State, excludeWords []string, out chan<- FeedResult, wg *sync.WaitGroup) {
@@ -615,6 +635,7 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 			EnableSlack:         appConfig.EnableSlack,
 			EnableMastodon:      appConfig.EnableMastodon && feedCfg.EnableMastodon,
 			MastodonAccessToken: feedCfg.MastodonAccessToken,
+			EnableCollection:    feedCfg.EnableCollection,
 		}
 
 		if isDelayed {
@@ -630,16 +651,16 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 	return notifyItems
 }
 
-func sendAggregatedNotifications(ctx context.Context, itemsByChannel map[string][]NotificationItem) {
-	if len(itemsByChannel) == 0 {
+func sendAggregatedNotifications(ctx context.Context, batches [][]NotificationItem) {
+	if len(batches) == 0 {
 		return
 	}
 
 	var errs []string
 
-	for _, items := range itemsByChannel {
+	for _, batch := range batches {
 		// Mastodon
-		for _, item := range items {
+		for _, item := range batch {
 			if err := postToMastodon(ctx, item); err != nil {
 				slog.Error("Notification failed",
 					"error_type", "notification_error",
@@ -653,16 +674,14 @@ func sendAggregatedNotifications(ctx context.Context, itemsByChannel map[string]
 		}
 
 		// Slack
-		if err := postToSlack(items); err != nil {
+		if err := postToSlack(batch); err != nil {
 			slog.Error("Notification failed",
 				"error_type", "notification_error",
 				"platform", "slack",
-				"count", len(items),
+				"count", len(batch),
 				"error", err,
 			)
-			// Get channelID from the first item since we know they are grouped
-			channelID := items[0].SlackChannelID
-			errs = append(errs, fmt.Sprintf("Slack(%s): %v", channelID, err))
+			errs = append(errs, fmt.Sprintf("Slack(%s): %v", batch[0].SlackChannelID, err))
 		}
 	}
 
