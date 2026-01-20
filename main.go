@@ -45,7 +45,7 @@ const (
 	initialNotificationLimit = 5
 	rssHistoryMultiplier     = 2.0
 	translationRetryCount    = 5
-	gracefulShutdownBuffer   = 2 * time.Second
+	gracefulShutdownBuffer   = 1 * time.Minute
 	translationConcurrency   = 3
 
 	// 1: FeedTitle, 2: Title, 3: Link, 4: Description, 5: PreviousTitle, 6: PreviousLink
@@ -429,12 +429,8 @@ func collectResults(ctx context.Context, resultCh <-chan FeedResult, newState *S
 			batches = append(batches, newBatches...)
 
 		case <-shutdownCh:
-			slog.Warn("Approaching Lambda timeout, saving state and performing graceful shutdown")
-			if err := saveStateFunc(newState); err != nil {
-				slog.Error("Failed to save state during graceful shutdown", "error", err)
-				return nil, err
-			}
-			return nil, fmt.Errorf("graceful shutdown due to timeout")
+			slog.Warn("Approaching Lambda timeout, stopping feed collection to prioritize notification delivery")
+			return finalizeBatches(batches, groupedItems), nil
 
 		case <-ctx.Done():
 			slog.Warn("Context done, saving state", "error", ctx.Err())
