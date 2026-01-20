@@ -111,6 +111,10 @@ var (
 
 	translationRateLimiter = &RateLimiter{}
 	translationSemaphore   = make(chan struct{}, translationConcurrency)
+
+	// Notification processing functions (variables for testing)
+	processMastodonFunc = defaultProcessMastodon
+	processSlackFunc    = defaultProcessSlack
 )
 
 type RateLimiter struct {
@@ -676,34 +680,24 @@ func sendAggregatedNotifications(ctx context.Context, batches [][]NotificationIt
 		return
 	}
 
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
 	var errs []string
 
 	for _, batch := range batches {
 		// Mastodon
 		for _, item := range batch {
-			if err := postToMastodon(ctx, item); err != nil {
-				slog.Error("Notification failed",
-					"error_type", "notification_error",
-					"platform", "mastodon",
-					"item_title", item.Title,
-					"url", item.Link,
-					"error", err,
-				)
-				errs = append(errs, fmt.Sprintf("Mastodon: %v", err))
-			}
+			wg.Add(1)
+			go processMastodonFunc(ctx, item, &wg, &errMu, &errs)
+			time.Sleep(notificationDelay)
 		}
 
 		// Slack
-		if err := postToSlack(batch); err != nil {
-			slog.Error("Notification failed",
-				"error_type", "notification_error",
-				"platform", "slack",
-				"count", len(batch),
-				"error", err,
-			)
-			errs = append(errs, fmt.Sprintf("Slack(%s): %v", batch[0].SlackChannelID, err))
-		}
+		wg.Add(1)
+		go processSlackFunc(batch, &wg, &errMu, &errs)
 	}
+
+	wg.Wait()
 
 	if len(errs) > 0 {
 		slog.Error("Some notifications failed", "errors", strings.Join(errs, ", "))
@@ -796,6 +790,37 @@ func cleanHTML(htmlContent string) string {
 	return urlRegex.ReplaceAllString(text, "")
 }
 
+func defaultProcessMastodon(ctx context.Context, item NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string) {
+	defer wg.Done()
+	if err := postToMastodon(ctx, item); err != nil {
+		slog.Error("Notification failed",
+			"error_type", "notification_error",
+			"platform", "mastodon",
+			"item_title", item.Title,
+			"url", item.Link,
+			"error", err,
+		)
+		errMu.Lock()
+		*errs = append(*errs, fmt.Sprintf("Mastodon: %v", err))
+		errMu.Unlock()
+	}
+}
+
+func defaultProcessSlack(batch []NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string) {
+	defer wg.Done()
+	if err := postToSlack(batch); err != nil {
+		slog.Error("Notification failed",
+			"error_type", "notification_error",
+			"platform", "slack",
+			"count", len(batch),
+			"error", err,
+		)
+		errMu.Lock()
+		*errs = append(*errs, fmt.Sprintf("Slack(%s): %v", batch[0].SlackChannelID, err))
+		errMu.Unlock()
+	}
+}
+
 func postToSlack(items []NotificationItem) error {
 	if len(items) == 0 {
 		return nil
@@ -826,7 +851,6 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 	if !item.EnableMastodon {
 		return nil
 	}
-	defer time.Sleep(notificationDelay)
 
 	accessToken := mastodonAccessToken
 	if item.MastodonAccessToken != "" {

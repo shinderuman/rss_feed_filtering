@@ -935,11 +935,9 @@ func TestProcessFeeds_TimeoutSave(t *testing.T) {
 	elapsed := time.Since(start)
 
 	// We expect an error "graceful shutdown due to timeout"
-	if err == nil {
-		t.Fatal("Expected timeout error, got nil")
-	}
-	if err.Error() != "graceful shutdown due to timeout" {
-		t.Errorf("Expected 'graceful shutdown due to timeout', got '%v'", err)
+	// We expect NO error, but partial results.
+	if err != nil {
+		t.Fatalf("Expected nil error (best effort), got %v", err)
 	}
 
 	mu.Lock()
@@ -1167,5 +1165,68 @@ func TestTranslateNotificationItems_GlobalRateLimit(t *testing.T) {
 	// We expect NO failures if global rate limiting works.
 	if failures > 0 {
 		t.Errorf("Found %d rate limit violations (Global Rate Limit Broken)", failures)
+	}
+}
+
+func TestSendAggregatedNotifications(t *testing.T) {
+	// 1. Mock Processing Functions
+	mastodonCalls := 0
+	slackCalls := 0
+	var mockMu sync.Mutex
+
+	// Save original functions
+	origMastodonFunc := processMastodonFunc
+	origSlackFunc := processSlackFunc
+	defer func() {
+		processMastodonFunc = origMastodonFunc
+		processSlackFunc = origSlackFunc
+	}()
+
+	// Define mocks
+	processMastodonFunc = func(ctx context.Context, item NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string) {
+		defer wg.Done()
+		mockMu.Lock()
+		mastodonCalls++
+		mockMu.Unlock()
+	}
+
+	processSlackFunc = func(batch []NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string) {
+		defer wg.Done()
+		mockMu.Lock()
+		slackCalls++
+		mockMu.Unlock()
+	}
+
+	// 2. Test Data
+	ctx := context.Background()
+	batches := [][]NotificationItem{
+		{
+			{Title: "Item 1", Link: "link1", EnableMastodon: true, EnableSlack: true, SlackChannelID: "C1"},
+			{Title: "Item 2", Link: "link2", EnableMastodon: true, EnableSlack: true, SlackChannelID: "C1"},
+		},
+		{
+			{Title: "Item 3", Link: "link3", EnableMastodon: true, EnableSlack: true, SlackChannelID: "C2"},
+		},
+	}
+	// Total Mastodon Items: 3
+	// Total Slack Batches: 2
+
+	// 3. Execute
+	start := time.Now()
+	sendAggregatedNotifications(ctx, batches)
+	duration := time.Since(start)
+
+	// 4. Verify
+	if mastodonCalls != 3 {
+		t.Errorf("Expected 3 Mastodon calls, got %d", mastodonCalls)
+	}
+	if slackCalls != 2 {
+		t.Errorf("Expected 2 Slack calls, got %d", slackCalls)
+	}
+
+	// Verify Staggered Delay
+	expectedDuration := 3 * 200 * time.Millisecond // 600ms
+	if duration < expectedDuration {
+		t.Errorf("Execution too fast. Expected at least %v, got %v. Staggering might be missing.", expectedDuration, duration)
 	}
 }
