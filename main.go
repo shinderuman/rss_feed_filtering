@@ -39,6 +39,7 @@ const (
 	defaultTimeout           = 10 * time.Second
 	anthropicMaxTokens       = 1024
 	maxStatusLength          = 500
+	maxDescriptionLines      = 5
 	delayedStartIndex        = 1
 	domainDelay              = 500 * time.Millisecond
 	notificationDelay        = 200 * time.Millisecond // Initial notification limit for new feeds
@@ -646,7 +647,7 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 			break
 		}
 
-		cleanDesc := cleanHTML(item.Description)
+		cleanDesc := truncateDescription(cleanHTML(item.Description))
 		if item.Title == "" && cleanDesc == "" {
 			continue
 		}
@@ -781,11 +782,19 @@ func isDelayedDomain(feedURL string, domains []string) bool {
 	return false
 }
 
+func convertBlocksToNewlines(doc *goquery.Document) {
+	doc.Find("br").ReplaceWithHtml("\n")
+	doc.Find("p, div, li, tr, h1, h2, h3, h4, h5, h6").Each(func(_ int, s *goquery.Selection) {
+		s.AfterHtml("\n")
+	})
+}
+
 func cleanHTML(htmlContent string) string {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(htmlContent))
 	if err != nil {
 		return htmlContent
 	}
+	convertBlocksToNewlines(doc)
 	text := strings.TrimSpace(doc.Text())
 
 	return urlRegex.ReplaceAllString(text, "")
@@ -797,6 +806,14 @@ func truncateStatus(status string) string {
 		return string(runes[:maxStatusLength-3]) + "..."
 	}
 	return status
+}
+
+func truncateDescription(desc string) string {
+	lines := strings.Split(desc, "\n")
+	if len(lines) > maxDescriptionLines {
+		return strings.Join(lines[:maxDescriptionLines], "\n")
+	}
+	return desc
 }
 
 func defaultProcessMastodon(ctx context.Context, item NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string) {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mmcdole/gofeed"
+	"github.com/PuerkitoBio/goquery"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -1544,6 +1545,36 @@ func TestIsDelayedDomain(t *testing.T) {
 	}
 }
 
+func TestConvertBlocksToNewlines(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "brを改行へ", in: "<body>1<br>2</body>", want: "1\n2"},
+		{name: "pを改行へ", in: "<body><p>A</p><p>B</p></body>", want: "A\nB"},
+		{name: "liを改行へ", in: "<body><ul><li>x</li><li>y</li></ul></body>", want: "x\ny"},
+		{name: "divを改行へ", in: "<body><div>A</div><div>B</div></body>", want: "A\nB"},
+		{name: "見出しを改行へ", in: "<body><h1>Title</h1>text</body>", want: "Title\ntext"},
+		{name: "インラインは改行しない", in: "<body><a href=\"u\">link</a> text</body>", want: "link text"},
+		{name: "空要素", in: "<body></body>", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, err := goquery.NewDocumentFromReader(strings.NewReader(tt.in))
+			if err != nil {
+				t.Fatalf("parse error = %v", err)
+			}
+			convertBlocksToNewlines(doc)
+			got := strings.TrimSpace(doc.Text())
+			if got != tt.want {
+				t.Errorf("convertBlocksToNewlines() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCleanHTML(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1554,6 +1585,12 @@ func TestCleanHTML(t *testing.T) {
 		{name: "URL除去", in: "see https://example.com for details", want: "see  for details"},
 		{name: "空文字", in: "", want: ""},
 		{name: "前後空白トリム", in: "  <p>text</p>  ", want: "text"},
+		{name: "brで改行", in: "1行目<br>2行目<br>3行目", want: "1行目\n2行目\n3行目"},
+		{name: "p段落で改行", in: "<p>A</p><p>B</p>", want: "A\nB"},
+		{name: "li要素で改行", in: "<ul><li>x</li><li>y</li></ul>", want: "x\ny"},
+		{name: "連続空行は圧縮しない", in: "<p>A</p><p></p><p>B</p>", want: "A\n\nB"},
+		{name: "divで改行", in: "<div>A</div><div>B</div>", want: "A\nB"},
+		{name: "インラインタグは改行しない", in: "<a href=\"u\">link</a> text", want: "link text"},
 	}
 
 	for _, tt := range tests {
@@ -1617,6 +1654,29 @@ func TestTruncateStatus(t *testing.T) {
 	wantRunes := []rune(japanese)[:maxStatusLength-3]
 	if string([]rune(got)[:maxStatusLength-3]) != string(wantRunes) || !strings.HasSuffix(got, "...") {
 		t.Errorf("truncateStatus() Japanese = len(rune)=%d, want 497 runes + ...", len([]rune(got)))
+	}
+}
+
+func TestTruncateDescription(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "5行ちょうどそのまま", in: "1\n2\n3\n4\n5", want: "1\n2\n3\n4\n5"},
+		{name: "6行→5行に切り詰め", in: "1\n2\n3\n4\n5\n6", want: "1\n2\n3\n4\n5"},
+		{name: "1行そのまま", in: "only", want: "only"},
+		{name: "空文字", in: "", want: ""},
+		{name: "空行含む6行→5行", in: "A\n\nB\n\nC\nD", want: "A\n\nB\n\nC"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateDescription(tt.in)
+			if got != tt.want {
+				t.Errorf("truncateDescription() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
