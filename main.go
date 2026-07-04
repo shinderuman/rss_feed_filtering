@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -35,19 +36,21 @@ import (
 )
 
 const (
-	userAgent                = "RSS-Filter-Bot/1.0"
-	defaultTimeout           = 10 * time.Second
-	anthropicMaxTokens       = 1024
-	maxStatusLength          = 500
-	maxDescriptionLines      = 5
-	delayedStartIndex        = 1
-	domainDelay              = 500 * time.Millisecond
-	notificationDelay        = 200 * time.Millisecond // Initial notification limit for new feeds
-	initialNotificationLimit = 5
-	rssHistoryMultiplier     = 2.0
-	translationRetryCount    = 5
-	gracefulShutdownBuffer   = 1 * time.Minute
-	translationConcurrency   = 3
+	userAgent                   = "RSS-Filter-Bot/1.0"
+	defaultTimeout              = 10 * time.Second
+	anthropicMaxTokens          = 1024
+	maxStatusLength             = 500
+	maxDescriptionLines         = 5
+	slackRateLimitFallbackPause = 30 * time.Minute
+	slackPauseBuffer            = 1 * time.Minute
+	delayedStartIndex           = 1
+	domainDelay                 = 500 * time.Millisecond
+	notificationDelay           = 200 * time.Millisecond // Initial notification limit for new feeds
+	initialNotificationLimit    = 5
+	rssHistoryMultiplier        = 2.0
+	translationRetryCount       = 5
+	gracefulShutdownBuffer      = 1 * time.Minute
+	translationConcurrency      = 3
 
 	// 1: FeedTitle, 2: Title, 3: Link, 4: Description, 5: PreviousTitle, 6: PreviousLink
 	slackFormatDelayed = `*<%[6]s|[%[1]s] %[5]s>*
@@ -160,7 +163,8 @@ type FeedFilterConfig struct {
 }
 
 type State struct {
-	Feeds map[string]FeedState `json:"feeds"`
+	Feeds            map[string]FeedState `json:"feeds"`
+	SlackPausedUntil *time.Time           `json:"slack_paused_until,omitempty"`
 }
 
 type FeedState struct {
@@ -307,7 +311,9 @@ func run(ctx context.Context) error {
 		slog.Error("Some feeds failed", "error", processErr)
 	}
 
-	sendAggregatedNotifications(ctx, notifications)
+	sendAggregatedNotifications(ctx, notifications, state, func(s *State) error {
+		return saveState(ctx, s3Client, s)
+	})
 
 	return processErr
 }
@@ -677,7 +683,18 @@ func getNotificationItems(feed *gofeed.Feed, feedCfg FeedFilterConfig, seenLinks
 	return notifyItems
 }
 
-func sendAggregatedNotifications(ctx context.Context, batches [][]NotificationItem) {
+func isSlackPaused(state *State) bool {
+	return state.SlackPausedUntil != nil && time.Now().Before(*state.SlackPausedUntil)
+}
+
+func slackPauseUntil(retryAfter time.Duration) time.Time {
+	if retryAfter <= 0 {
+		return time.Now().Add(slackRateLimitFallbackPause)
+	}
+	return time.Now().Add(retryAfter).Add(slackPauseBuffer)
+}
+
+func sendAggregatedNotifications(ctx context.Context, batches [][]NotificationItem, state *State, saveStateFunc SaveStateFunc) {
 	if len(batches) == 0 {
 		return
 	}
@@ -685,6 +702,13 @@ func sendAggregatedNotifications(ctx context.Context, batches [][]NotificationIt
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var errs []string
+
+	slackPaused := isSlackPaused(state)
+	if slackPaused {
+		slog.Warn("Slack notifications skipped due to rate-limit pause",
+			"resume_at", state.SlackPausedUntil)
+	}
+	var rateLimited atomic.Bool
 
 	for _, batch := range batches {
 		// Mastodon
@@ -695,8 +719,11 @@ func sendAggregatedNotifications(ctx context.Context, batches [][]NotificationIt
 		}
 
 		// Slack
+		if slackPaused || rateLimited.Load() {
+			continue
+		}
 		wg.Add(1)
-		go processSlackFunc(batch, &wg, &errMu, &errs)
+		go processSlackFunc(batch, &wg, &errMu, &errs, state, saveStateFunc, &rateLimited)
 	}
 
 	wg.Wait()
@@ -832,9 +859,26 @@ func defaultProcessMastodon(ctx context.Context, item NotificationItem, wg *sync
 	}
 }
 
-func defaultProcessSlack(batch []NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string) {
+func defaultProcessSlack(batch []NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string, state *State, saveStateFunc SaveStateFunc, rateLimited *atomic.Bool) {
 	defer wg.Done()
 	if err := postToSlack(batch); err != nil {
+		var rateLimitErr *slack.RateLimitedError
+		if errors.As(err, &rateLimitErr) {
+			until := slackPauseUntil(rateLimitErr.RetryAfter)
+			errMu.Lock()
+			state.SlackPausedUntil = &until
+			saveErr := saveStateFunc(state)
+			errMu.Unlock()
+			if saveErr != nil {
+				slog.Error("Failed to save Slack pause state", "error", saveErr)
+			}
+			rateLimited.Store(true)
+			slog.Warn("Slack rate limited, pausing notifications",
+				"retry_after", rateLimitErr.RetryAfter,
+				"resume_at", until,
+			)
+			return
+		}
 		slog.Error("Notification failed",
 			"error_type", "notification_error",
 			"platform", "slack",

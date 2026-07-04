@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,11 +13,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/mmcdole/gofeed"
 	"github.com/PuerkitoBio/goquery"
+	"github.com/mmcdole/gofeed"
+	"github.com/slack-go/slack"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -1299,7 +1302,7 @@ func TestSendAggregatedNotifications(t *testing.T) {
 		mockMu.Unlock()
 	}
 
-	processSlackFunc = func(batch []NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string) {
+	processSlackFunc = func(batch []NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string, state *State, saveStateFunc SaveStateFunc, rateLimited *atomic.Bool) {
 		defer wg.Done()
 		mockMu.Lock()
 		slackCalls++
@@ -1322,7 +1325,7 @@ func TestSendAggregatedNotifications(t *testing.T) {
 
 	// 3. Execute
 	start := time.Now()
-	sendAggregatedNotifications(ctx, batches)
+	sendAggregatedNotifications(ctx, batches, &State{Feeds: map[string]FeedState{}}, func(s *State) error { return nil })
 	duration := time.Since(start)
 
 	// 4. Verify
@@ -1342,7 +1345,7 @@ func TestSendAggregatedNotifications(t *testing.T) {
 
 func TestSendAggregatedNotifications_EmptyAndErrors(t *testing.T) {
 	// 空バッチ
-	sendAggregatedNotifications(context.Background(), nil)
+	sendAggregatedNotifications(context.Background(), nil, &State{Feeds: map[string]FeedState{}}, func(s *State) error { return nil })
 
 	// モックでエラーを発生
 	origMastodon := processMastodonFunc
@@ -1357,7 +1360,83 @@ func TestSendAggregatedNotifications_EmptyAndErrors(t *testing.T) {
 	batches := [][]NotificationItem{
 		{{Title: "T", Link: "http://e.com/1", EnableMastodon: true}},
 	}
-	sendAggregatedNotifications(context.Background(), batches)
+	sendAggregatedNotifications(context.Background(), batches, &State{Feeds: map[string]FeedState{}}, func(s *State) error { return nil })
+}
+
+func TestSendAggregatedNotifications_SkipsSlackWhenPaused(t *testing.T) {
+	slackCalls := 0
+	var mockMu sync.Mutex
+
+	origSlackFunc := processSlackFunc
+	t.Cleanup(func() { processSlackFunc = origSlackFunc })
+	processSlackFunc = func(batch []NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string, state *State, saveStateFunc SaveStateFunc, rateLimited *atomic.Bool) {
+		defer wg.Done()
+		mockMu.Lock()
+		slackCalls++
+		mockMu.Unlock()
+	}
+
+	future := time.Now().Add(10 * time.Minute)
+	state := &State{Feeds: map[string]FeedState{}, SlackPausedUntil: &future}
+
+	batches := [][]NotificationItem{
+		{{Title: "T", Link: "http://e.com/1", EnableSlack: true, SlackChannelID: "C1"}},
+		{{Title: "T2", Link: "http://e.com/2", EnableSlack: true, SlackChannelID: "C1"}},
+	}
+	sendAggregatedNotifications(context.Background(), batches, state, func(s *State) error { return nil })
+
+	if slackCalls != 0 {
+		t.Errorf("Slack calls = %d, want 0 when paused", slackCalls)
+	}
+}
+
+func TestDefaultProcessSlack_RateLimitedUpdatesState(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer ts.Close()
+
+	origAPIURL := slackAPIURL
+	origToken := slackBotToken
+	slackAPIURL = ts.URL + "/"
+	slackBotToken = "dummy-token"
+	t.Cleanup(func() {
+		slackAPIURL = origAPIURL
+		slackBotToken = origToken
+	})
+
+	state := &State{Feeds: map[string]FeedState{}}
+	var savedState *State
+	saveFunc := func(s *State) error {
+		savedState = s
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []string
+	var rateLimited atomic.Bool
+
+	wg.Add(1)
+	defaultProcessSlack([]NotificationItem{{Title: "T", EnableSlack: true, SlackChannelID: "C1"}}, &wg, &mu, &errs, state, saveFunc, &rateLimited)
+	wg.Wait()
+
+	if !rateLimited.Load() {
+		t.Error("rateLimited flag should be set on 429")
+	}
+	if state.SlackPausedUntil == nil {
+		t.Fatal("SlackPausedUntil should be set")
+	}
+	if !state.SlackPausedUntil.After(time.Now()) {
+		t.Errorf("SlackPausedUntil = %v, want future", *state.SlackPausedUntil)
+	}
+	if savedState == nil {
+		t.Error("saveStateFunc should be called on 429")
+	}
+	if len(errs) != 0 {
+		t.Errorf("errs = %v, want empty (429 is not a notification error)", errs)
+	}
 }
 
 func TestUpdateStateWithLatestItem(t *testing.T) {
@@ -1450,11 +1529,11 @@ func TestDetermineLastLink(t *testing.T) {
 		want         string
 	}{
 		{
-			name:         "notifyItemsあり→先頭Link",
-			notifyItems:  []NotificationItem{{Link: "https://new.example.com/1"}},
-			feed:         &gofeed.Feed{},
-			feedURL:      "https://example.com/feed",
-			want:         "https://new.example.com/1",
+			name:        "notifyItemsあり→先頭Link",
+			notifyItems: []NotificationItem{{Link: "https://new.example.com/1"}},
+			feed:        &gofeed.Feed{},
+			feedURL:     "https://example.com/feed",
+			want:        "https://new.example.com/1",
 		},
 		{
 			name:         "LastLink空・非delayed→feed.Items[0]",
@@ -1700,9 +1779,10 @@ func TestDefaultProcessSlack_Error(t *testing.T) {
 	var mu sync.Mutex
 	var errs []string
 	batch := []NotificationItem{{Title: "T", EnableSlack: true, SlackChannelID: "C1"}}
+	var rateLimited atomic.Bool
 
 	wg.Add(1)
-	defaultProcessSlack(batch, &wg, &mu, &errs)
+	defaultProcessSlack(batch, &wg, &mu, &errs, &State{Feeds: map[string]FeedState{}}, func(s *State) error { return nil }, &rateLimited)
 	wg.Wait()
 
 	if len(errs) == 0 {
@@ -1779,6 +1859,70 @@ func TestPostToSlack_Error(t *testing.T) {
 	err := postToSlack(items)
 	if err == nil {
 		t.Error("postToSlack() expected error for ok=false, got nil")
+	}
+}
+
+func TestPostToSlack_RateLimited(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer ts.Close()
+
+	origAPIURL := slackAPIURL
+	origToken := slackBotToken
+	slackAPIURL = ts.URL + "/"
+	slackBotToken = "dummy-token"
+	t.Cleanup(func() {
+		slackAPIURL = origAPIURL
+		slackBotToken = origToken
+	})
+
+	items := []NotificationItem{{Title: "T", EnableSlack: true, SlackChannelID: "C1"}}
+	err := postToSlack(items)
+
+	var rateLimitErr *slack.RateLimitedError
+	if !errors.As(err, &rateLimitErr) {
+		t.Fatalf("postToSlack() expected *RateLimitedError, got %T: %v", err, err)
+	}
+	if rateLimitErr.RetryAfter != 30*time.Second {
+		t.Errorf("RetryAfter = %v, want 30s", rateLimitErr.RetryAfter)
+	}
+}
+
+func TestIsSlackPaused(t *testing.T) {
+	future := time.Now().Add(10 * time.Minute)
+	past := time.Now().Add(-10 * time.Minute)
+
+	tests := []struct {
+		name  string
+		state *State
+		want  bool
+	}{
+		{name: "nil（休止なし）", state: &State{SlackPausedUntil: nil}, want: false},
+		{name: "未来時刻（休止中）", state: &State{SlackPausedUntil: &future}, want: true},
+		{name: "過去時刻（復帰済み）", state: &State{SlackPausedUntil: &past}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSlackPaused(tt.state); got != tt.want {
+				t.Errorf("isSlackPaused() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSlackPauseUntil(t *testing.T) {
+	// Retry-After あり: now + retryAfter + buffer
+	withRA := slackPauseUntil(30 * time.Second)
+	if !withRA.After(time.Now().Add(29 * time.Second)) {
+		t.Errorf("slackPauseUntil(30s) = %v, want after now+29s (buffer含む)", withRA)
+	}
+
+	// Retry-After ゼロ/負: フォールバック
+	fallback := slackPauseUntil(0)
+	if !fallback.After(time.Now().Add(29 * time.Minute)) {
+		t.Errorf("slackPauseUntil(0) = %v, want fallback ~30m", fallback)
 	}
 }
 
