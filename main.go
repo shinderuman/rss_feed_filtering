@@ -99,6 +99,7 @@ var (
 	s3ConfigKey                  string
 	s3StateKey                   string
 	slackBotToken                string
+	slackAPIURL                  string
 	mastodonServer               string
 	mastodonAccessToken          string
 	anthropicAuthToken           string
@@ -838,7 +839,11 @@ func postToSlack(items []NotificationItem) error {
 		return nil
 	}
 
-	api := slack.New(slackBotToken)
+	var opts []slack.Option
+	if slackAPIURL != "" {
+		opts = append(opts, slack.OptionAPIURL(slackAPIURL))
+	}
+	api := slack.New(slackBotToken, opts...)
 
 	var sb strings.Builder
 	for i, item := range items {
