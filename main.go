@@ -38,7 +38,7 @@ const (
 	userAgent                = "RSS-Filter-Bot/1.0"
 	defaultTimeout           = 10 * time.Second
 	anthropicMaxTokens       = 1024
-	mastodonMaxStatusLength  = 500
+	maxStatusLength          = 500
 	delayedStartIndex        = 1
 	domainDelay              = 500 * time.Millisecond
 	notificationDelay        = 200 * time.Millisecond // Initial notification limit for new feeds
@@ -790,6 +790,14 @@ func cleanHTML(htmlContent string) string {
 	return urlRegex.ReplaceAllString(text, "")
 }
 
+func truncateStatus(status string) string {
+	runes := []rune(status)
+	if len(runes) > maxStatusLength {
+		return string(runes[:maxStatusLength-3]) + "..."
+	}
+	return status
+}
+
 func defaultProcessMastodon(ctx context.Context, item NotificationItem, wg *sync.WaitGroup, errMu *sync.Mutex, errs *[]string) {
 	defer wg.Done()
 	if err := postToMastodon(ctx, item); err != nil {
@@ -837,7 +845,7 @@ func postToSlack(items []NotificationItem) error {
 		if i > 0 {
 			sb.WriteString("\n\n")
 		}
-		sb.WriteString(item.Format(true))
+		sb.WriteString(truncateStatus(item.Format(true)))
 	}
 
 	_, _, err := api.PostMessage(
@@ -861,11 +869,7 @@ func postToMastodon(ctx context.Context, item NotificationItem) error {
 		AccessToken: accessToken,
 	})
 
-	status := item.Format(false)
-	runes := []rune(status)
-	if len(runes) > mastodonMaxStatusLength {
-		status = string(runes[:mastodonMaxStatusLength-3]) + "..."
-	}
+	status := truncateStatus(item.Format(false))
 
 	_, err := c.PostStatus(ctx, &mastodon.Toot{
 		Status:     status,
